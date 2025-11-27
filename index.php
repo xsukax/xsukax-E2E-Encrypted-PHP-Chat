@@ -4,7 +4,9 @@ ini_set('display_errors', 0);
 session_start();
 
 define('DB_FILE', 'chats.db');
-define('CHAT_LIFETIME', 24 * 60 * 60); // 24 hours
+define('CHAT_LIFETIME', 24 * 60 * 60);
+define('HEARTBEAT_TIMEOUT', 30);
+define('MAX_PARTICIPANTS', 2);
 
 function initDB() {
     try {
@@ -23,8 +25,23 @@ function initDB() {
             user_id TEXT NOT NULL,
             encrypted_content TEXT NOT NULL,
             timestamp INTEGER NOT NULL,
-            edited INTEGER DEFAULT 0
+            edited INTEGER DEFAULT 0,
+            deleted INTEGER DEFAULT 0,
+            version INTEGER DEFAULT 1,
+            msg_type TEXT DEFAULT "message"
         )');
+        
+        $db->exec('CREATE TABLE IF NOT EXISTS participants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            encrypted_name TEXT NOT NULL,
+            last_seen INTEGER NOT NULL,
+            UNIQUE(chat_id, user_id)
+        )');
+        
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id)');
+        $db->exec('CREATE INDEX IF NOT EXISTS idx_participants_chat ON participants(chat_id)');
         
         return $db;
     } catch (Exception $e) {
@@ -42,10 +59,58 @@ function cleanupOldChats($db) {
         while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
             $chatId = $row['id'];
             $db->exec("DELETE FROM messages WHERE chat_id = '" . SQLite3::escapeString($chatId) . "'");
+            $db->exec("DELETE FROM participants WHERE chat_id = '" . SQLite3::escapeString($chatId) . "'");
             $db->exec("DELETE FROM chats WHERE id = '" . SQLite3::escapeString($chatId) . "'");
         }
-    } catch (Exception $e) {
+    } catch (Exception $e) {}
+}
+
+function cleanupInactiveParticipants($db, $chatId) {
+    $timeout = time() - HEARTBEAT_TIMEOUT;
+    $stmt = $db->prepare('SELECT user_id, encrypted_name FROM participants WHERE chat_id = :chat_id AND last_seen < :timeout');
+    $stmt->bindValue(':chat_id', $chatId, SQLITE3_TEXT);
+    $stmt->bindValue(':timeout', $timeout, SQLITE3_INTEGER);
+    $result = $stmt->execute();
+    
+    $removed = [];
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $removed[] = ['user_id' => $row['user_id'], 'encrypted_name' => $row['encrypted_name']];
     }
+    
+    $stmt = $db->prepare('DELETE FROM participants WHERE chat_id = :chat_id AND last_seen < :timeout');
+    $stmt->bindValue(':chat_id', $chatId, SQLITE3_TEXT);
+    $stmt->bindValue(':timeout', $timeout, SQLITE3_INTEGER);
+    $stmt->execute();
+    
+    return $removed;
+}
+
+function getActiveParticipantCount($db, $chatId) {
+    cleanupInactiveParticipants($db, $chatId);
+    $stmt = $db->prepare('SELECT COUNT(*) as cnt FROM participants WHERE chat_id = :chat_id');
+    $stmt->bindValue(':chat_id', $chatId, SQLITE3_TEXT);
+    $result = $stmt->execute();
+    $row = $result->fetchArray(SQLITE3_ASSOC);
+    return (int)$row['cnt'];
+}
+
+function isUserInRoom($db, $chatId, $userId) {
+    $stmt = $db->prepare('SELECT id FROM participants WHERE chat_id = :chat_id AND user_id = :user_id');
+    $stmt->bindValue(':chat_id', $chatId, SQLITE3_TEXT);
+    $stmt->bindValue(':user_id', $userId, SQLITE3_TEXT);
+    $result = $stmt->execute();
+    return $result->fetchArray(SQLITE3_ASSOC) !== false;
+}
+
+function addSystemMessage($db, $chatId, $type, $encryptedContent) {
+    $stmt = $db->prepare('INSERT INTO messages (chat_id, user_id, encrypted_content, timestamp, msg_type) VALUES (:chat_id, :user_id, :content, :time, :type)');
+    $stmt->bindValue(':chat_id', $chatId, SQLITE3_TEXT);
+    $stmt->bindValue(':user_id', 'SYSTEM', SQLITE3_TEXT);
+    $stmt->bindValue(':content', $encryptedContent, SQLITE3_TEXT);
+    $stmt->bindValue(':time', time(), SQLITE3_INTEGER);
+    $stmt->bindValue(':type', $type, SQLITE3_TEXT);
+    $stmt->execute();
+    return $db->lastInsertRowID();
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -76,47 +141,205 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             echo json_encode(['success' => true, 'chat_id' => $chatId]);
             
         } elseif ($action === 'verify_chat') {
+            $chatId = $_POST['chat_id'] ?? '';
+            $userId = $_POST['user_id'] ?? '';
+            
             $stmt = $db->prepare('SELECT password_hash, created_at FROM chats WHERE id = :id');
-            $stmt->bindValue(':id', $_POST['chat_id'] ?? '', SQLITE3_TEXT);
+            $stmt->bindValue(':id', $chatId, SQLITE3_TEXT);
             $result = $stmt->execute();
             $row = $result->fetchArray(SQLITE3_ASSOC);
             
             if (!$row) {
                 echo json_encode(['success' => false, 'error' => 'Chat not found']);
             } elseif (password_verify($_POST['password_hash'] ?? '', $row['password_hash'])) {
-                echo json_encode(['success' => true, 'remaining_time' => CHAT_LIFETIME - (time() - $row['created_at'])]);
+                $currentCount = getActiveParticipantCount($db, $chatId);
+                $isAlreadyIn = isUserInRoom($db, $chatId, $userId);
+                
+                if (!$isAlreadyIn && $currentCount >= MAX_PARTICIPANTS) {
+                    echo json_encode(['success' => false, 'error' => 'Room is full (max 2 users)']);
+                } else {
+                    echo json_encode([
+                        'success' => true, 
+                        'remaining_time' => CHAT_LIFETIME - (time() - $row['created_at']),
+                        'participant_count' => $currentCount,
+                        'is_already_in' => $isAlreadyIn
+                    ]);
+                }
             } else {
                 echo json_encode(['success' => false, 'error' => 'Invalid password']);
             }
             
+        } elseif ($action === 'join_room') {
+            $chatId = $_POST['chat_id'] ?? '';
+            $userId = $_POST['user_id'] ?? '';
+            $encryptedName = $_POST['encrypted_name'] ?? '';
+            
+            if (empty($chatId) || empty($userId)) throw new Exception('Missing parameters');
+            
+            $removed = cleanupInactiveParticipants($db, $chatId);
+            $isAlreadyIn = isUserInRoom($db, $chatId, $userId);
+            $currentCount = getActiveParticipantCount($db, $chatId);
+            
+            if (!$isAlreadyIn && $currentCount >= MAX_PARTICIPANTS) {
+                echo json_encode(['success' => false, 'error' => 'Room is full']);
+            } else {
+                $stmt = $db->prepare('INSERT OR REPLACE INTO participants (chat_id, user_id, encrypted_name, last_seen) VALUES (:chat_id, :user_id, :name, :time)');
+                $stmt->bindValue(':chat_id', $chatId, SQLITE3_TEXT);
+                $stmt->bindValue(':user_id', $userId, SQLITE3_TEXT);
+                $stmt->bindValue(':name', $encryptedName, SQLITE3_TEXT);
+                $stmt->bindValue(':time', time(), SQLITE3_INTEGER);
+                $stmt->execute();
+                
+                if (!$isAlreadyIn) {
+                    $encryptedNotif = $_POST['encrypted_join_msg'] ?? '';
+                    if ($encryptedNotif) {
+                        addSystemMessage($db, $chatId, 'join', $encryptedNotif);
+                    }
+                }
+                
+                $stmt = $db->prepare('SELECT user_id, encrypted_name FROM participants WHERE chat_id = :chat_id');
+                $stmt->bindValue(':chat_id', $chatId, SQLITE3_TEXT);
+                $result = $stmt->execute();
+                $participants = [];
+                while ($p = $result->fetchArray(SQLITE3_ASSOC)) {
+                    $participants[] = $p;
+                }
+                
+                echo json_encode([
+                    'success' => true, 
+                    'participants' => $participants,
+                    'removed_users' => $removed
+                ]);
+            }
+            
+        } elseif ($action === 'leave_room') {
+            $chatId = $_POST['chat_id'] ?? '';
+            $userId = $_POST['user_id'] ?? '';
+            $encryptedLeaveMsg = $_POST['encrypted_leave_msg'] ?? '';
+            
+            $stmt = $db->prepare('DELETE FROM participants WHERE chat_id = :chat_id AND user_id = :user_id');
+            $stmt->bindValue(':chat_id', $chatId, SQLITE3_TEXT);
+            $stmt->bindValue(':user_id', $userId, SQLITE3_TEXT);
+            $stmt->execute();
+            
+            if ($encryptedLeaveMsg) {
+                addSystemMessage($db, $chatId, 'leave', $encryptedLeaveMsg);
+            }
+            
+            echo json_encode(['success' => true]);
+            
+        } elseif ($action === 'heartbeat') {
+            $chatId = $_POST['chat_id'] ?? '';
+            $userId = $_POST['user_id'] ?? '';
+            $encryptedName = $_POST['encrypted_name'] ?? '';
+            
+            $removed = cleanupInactiveParticipants($db, $chatId);
+            
+            foreach ($removed as $r) {
+                if ($r['user_id'] !== $userId && !empty($r['encrypted_name'])) {
+                    $leaveData = json_encode(['type' => 'timeout_leave', 'encrypted_name' => $r['encrypted_name']]);
+                    addSystemMessage($db, $chatId, 'leave', $leaveData);
+                }
+            }
+            
+            $stmt = $db->prepare('UPDATE participants SET last_seen = :time, encrypted_name = :name WHERE chat_id = :chat_id AND user_id = :user_id');
+            $stmt->bindValue(':time', time(), SQLITE3_INTEGER);
+            $stmt->bindValue(':name', $encryptedName, SQLITE3_TEXT);
+            $stmt->bindValue(':chat_id', $chatId, SQLITE3_TEXT);
+            $stmt->bindValue(':user_id', $userId, SQLITE3_TEXT);
+            $stmt->execute();
+            
+            $stmt = $db->prepare('SELECT user_id, encrypted_name FROM participants WHERE chat_id = :chat_id');
+            $stmt->bindValue(':chat_id', $chatId, SQLITE3_TEXT);
+            $result = $stmt->execute();
+            $participants = [];
+            while ($p = $result->fetchArray(SQLITE3_ASSOC)) {
+                $participants[] = $p;
+            }
+            
+            echo json_encode(['success' => true, 'participants' => $participants, 'removed' => $removed]);
+            
+        } elseif ($action === 'update_nickname') {
+            $chatId = $_POST['chat_id'] ?? '';
+            $userId = $_POST['user_id'] ?? '';
+            $encryptedName = $_POST['encrypted_name'] ?? '';
+            $encryptedRenameMsg = $_POST['encrypted_rename_msg'] ?? '';
+            
+            $stmt = $db->prepare('UPDATE participants SET encrypted_name = :name WHERE chat_id = :chat_id AND user_id = :user_id');
+            $stmt->bindValue(':name', $encryptedName, SQLITE3_TEXT);
+            $stmt->bindValue(':chat_id', $chatId, SQLITE3_TEXT);
+            $stmt->bindValue(':user_id', $userId, SQLITE3_TEXT);
+            $stmt->execute();
+            
+            if ($encryptedRenameMsg) {
+                addSystemMessage($db, $chatId, 'rename', $encryptedRenameMsg);
+            }
+            
+            echo json_encode(['success' => true]);
+            
         } elseif ($action === 'send_message') {
-            $stmt = $db->prepare('INSERT INTO messages (chat_id, user_id, encrypted_content, timestamp, edited) VALUES (:chat_id, :user_id, :content, :time, 0)');
+            $stmt = $db->prepare('INSERT INTO messages (chat_id, user_id, encrypted_content, timestamp, edited, msg_type) VALUES (:chat_id, :user_id, :content, :time, 0, :type)');
             $stmt->bindValue(':chat_id', $_POST['chat_id'] ?? '', SQLITE3_TEXT);
             $stmt->bindValue(':user_id', $_POST['user_id'] ?? '', SQLITE3_TEXT);
             $stmt->bindValue(':content', $_POST['encrypted_content'] ?? '', SQLITE3_TEXT);
             $stmt->bindValue(':time', time(), SQLITE3_INTEGER);
+            $stmt->bindValue(':type', 'message', SQLITE3_TEXT);
             $stmt->execute();
-            echo json_encode(['success' => true]);
+            echo json_encode(['success' => true, 'message_id' => $db->lastInsertRowID()]);
             
         } elseif ($action === 'edit_message') {
-            $stmt = $db->prepare('UPDATE messages SET encrypted_content = :content, edited = 1 WHERE id = :id AND user_id = :user_id');
-            $stmt->bindValue(':content', $_POST['encrypted_content'] ?? '', SQLITE3_TEXT);
-            $stmt->bindValue(':id', intval($_POST['message_id'] ?? 0), SQLITE3_INTEGER);
-            $stmt->bindValue(':user_id', $_POST['user_id'] ?? '', SQLITE3_TEXT);
-            $stmt->execute();
-            echo json_encode(['success' => $db->changes() > 0]);
+            $msgId = intval($_POST['message_id'] ?? 0);
+            $userId = $_POST['user_id'] ?? '';
+            
+            $stmt = $db->prepare('SELECT version FROM messages WHERE id = :id AND user_id = :user_id');
+            $stmt->bindValue(':id', $msgId, SQLITE3_INTEGER);
+            $stmt->bindValue(':user_id', $userId, SQLITE3_TEXT);
+            $result = $stmt->execute();
+            $row = $result->fetchArray(SQLITE3_ASSOC);
+            
+            if ($row) {
+                $newVersion = (int)$row['version'] + 1;
+                $stmt = $db->prepare('UPDATE messages SET encrypted_content = :content, edited = 1, version = :version WHERE id = :id AND user_id = :user_id');
+                $stmt->bindValue(':content', $_POST['encrypted_content'] ?? '', SQLITE3_TEXT);
+                $stmt->bindValue(':version', $newVersion, SQLITE3_INTEGER);
+                $stmt->bindValue(':id', $msgId, SQLITE3_INTEGER);
+                $stmt->bindValue(':user_id', $userId, SQLITE3_TEXT);
+                $stmt->execute();
+                echo json_encode(['success' => $db->changes() > 0, 'version' => $newVersion]);
+            } else {
+                echo json_encode(['success' => false, 'error' => 'Message not found']);
+            }
             
         } elseif ($action === 'delete_message') {
-            $stmt = $db->prepare('DELETE FROM messages WHERE id = :id AND user_id = :user_id');
-            $stmt->bindValue(':id', intval($_POST['message_id'] ?? 0), SQLITE3_INTEGER);
-            $stmt->bindValue(':user_id', $_POST['user_id'] ?? '', SQLITE3_TEXT);
-            $stmt->execute();
-            echo json_encode(['success' => $db->changes() > 0]);
+            $msgId = intval($_POST['message_id'] ?? 0);
+            $userId = $_POST['user_id'] ?? '';
+            
+            $stmt = $db->prepare('SELECT version FROM messages WHERE id = :id AND user_id = :user_id');
+            $stmt->bindValue(':id', $msgId, SQLITE3_INTEGER);
+            $stmt->bindValue(':user_id', $userId, SQLITE3_TEXT);
+            $result = $stmt->execute();
+            $row = $result->fetchArray(SQLITE3_ASSOC);
+            
+            if ($row) {
+                $newVersion = (int)$row['version'] + 1;
+                $stmt = $db->prepare('UPDATE messages SET deleted = 1, version = :version WHERE id = :id AND user_id = :user_id');
+                $stmt->bindValue(':version', $newVersion, SQLITE3_INTEGER);
+                $stmt->bindValue(':id', $msgId, SQLITE3_INTEGER);
+                $stmt->bindValue(':user_id', $userId, SQLITE3_TEXT);
+                $stmt->execute();
+                echo json_encode(['success' => $db->changes() > 0, 'version' => $newVersion]);
+            } else {
+                echo json_encode(['success' => false, 'error' => 'Message not found']);
+            }
             
         } elseif ($action === 'get_messages') {
-            $stmt = $db->prepare('SELECT id, user_id, encrypted_content, timestamp, edited FROM messages WHERE chat_id = :chat_id AND id > :last_id ORDER BY id ASC LIMIT 50');
-            $stmt->bindValue(':chat_id', $_POST['chat_id'] ?? '', SQLITE3_TEXT);
-            $stmt->bindValue(':last_id', intval($_POST['last_id'] ?? 0), SQLITE3_INTEGER);
+            $chatId = $_POST['chat_id'] ?? '';
+            $lastId = intval($_POST['last_id'] ?? 0);
+            $knownVersions = json_decode($_POST['known_versions'] ?? '{}', true) ?: [];
+            
+            $stmt = $db->prepare('SELECT id, user_id, encrypted_content, timestamp, edited, deleted, version, msg_type FROM messages WHERE chat_id = :chat_id AND id > :last_id ORDER BY id ASC LIMIT 100');
+            $stmt->bindValue(':chat_id', $chatId, SQLITE3_TEXT);
+            $stmt->bindValue(':last_id', $lastId, SQLITE3_INTEGER);
             $result = $stmt->execute();
             
             $messages = [];
@@ -126,10 +349,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'user_id' => $row['user_id'],
                     'encrypted_content' => $row['encrypted_content'],
                     'timestamp' => (int)$row['timestamp'],
-                    'edited' => (int)$row['edited']
+                    'edited' => (int)$row['edited'],
+                    'deleted' => (int)$row['deleted'],
+                    'version' => (int)$row['version'],
+                    'msg_type' => $row['msg_type']
                 ];
             }
-            echo json_encode(['success' => true, 'messages' => $messages]);
+            
+            $updates = [];
+            if (!empty($knownVersions)) {
+                $ids = array_keys($knownVersions);
+                $placeholders = implode(',', array_fill(0, count($ids), '?'));
+                $stmt = $db->prepare("SELECT id, user_id, encrypted_content, timestamp, edited, deleted, version, msg_type FROM messages WHERE chat_id = ? AND id IN ($placeholders)");
+                $stmt->bindValue(1, $chatId, SQLITE3_TEXT);
+                foreach ($ids as $i => $id) {
+                    $stmt->bindValue($i + 2, (int)$id, SQLITE3_INTEGER);
+                }
+                $result = $stmt->execute();
+                
+                while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+                    $msgId = (string)$row['id'];
+                    if (isset($knownVersions[$msgId]) && (int)$row['version'] > (int)$knownVersions[$msgId]) {
+                        $updates[] = [
+                            'id' => (int)$row['id'],
+                            'user_id' => $row['user_id'],
+                            'encrypted_content' => $row['encrypted_content'],
+                            'timestamp' => (int)$row['timestamp'],
+                            'edited' => (int)$row['edited'],
+                            'deleted' => (int)$row['deleted'],
+                            'version' => (int)$row['version'],
+                            'msg_type' => $row['msg_type']
+                        ];
+                    }
+                }
+            }
+            
+            echo json_encode(['success' => true, 'messages' => $messages, 'updates' => $updates]);
             
         } elseif ($action === 'destroy_chat') {
             $chatId = $_POST['chat_id'] ?? '';
@@ -140,14 +395,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $result = $stmt->execute();
             
             if ($result->fetchArray(SQLITE3_ASSOC)) {
-                $stmt = $db->prepare('DELETE FROM messages WHERE chat_id = :chat_id');
-                $stmt->bindValue(':chat_id', $chatId, SQLITE3_TEXT);
-                $stmt->execute();
-                
-                $stmt = $db->prepare('DELETE FROM chats WHERE id = :id');
-                $stmt->bindValue(':id', $chatId, SQLITE3_TEXT);
-                $stmt->execute();
-                
+                $db->exec("DELETE FROM messages WHERE chat_id = '" . SQLite3::escapeString($chatId) . "'");
+                $db->exec("DELETE FROM participants WHERE chat_id = '" . SQLite3::escapeString($chatId) . "'");
+                $db->exec("DELETE FROM chats WHERE id = '" . SQLite3::escapeString($chatId) . "'");
                 echo json_encode(['success' => true]);
             } else {
                 throw new Exception('Chat not found');
@@ -197,7 +447,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         .chat-header { background: #ffffff; border-bottom: 1px solid #e1e4e8; padding: 0.75rem 1rem; display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; flex-wrap: wrap; box-shadow: 0 1px 0 rgba(27,31,35,0.04); }
         .chat-header-left { flex: 1; min-width: 0; }
         .chat-header-title { font-size: 1rem; font-weight: 600; margin-bottom: 0.125rem; }
-        .chat-header-subtitle { font-size: 0.7rem; color: #57606a; }
+        .chat-header-subtitle { font-size: 0.7rem; color: #57606a; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+        .user-name-display { color: #0969da; font-weight: 600; cursor: pointer; text-decoration: underline; text-decoration-style: dotted; }
+        .user-name-display:hover { text-decoration-style: solid; }
+        .participants-badge { background: #ddf4ff; color: #0969da; padding: 0.125rem 0.375rem; border-radius: 10px; font-size: 0.65rem; font-weight: 600; }
         .chat-main { flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
         .messages-container { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 1rem; background: #fafbfc; -webkit-overflow-scrolling: touch; }
         .messages-container::-webkit-scrollbar { width: 6px; }
@@ -206,9 +459,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         .message-wrapper { margin-bottom: 0.625rem; display: flex; flex-direction: column; }
         .message-wrapper.sent { align-items: flex-end; }
         .message-wrapper.received { align-items: flex-start; }
+        .message-wrapper.system { align-items: center; }
         .message { max-width: 75%; padding: 0.5rem 0.75rem; border-radius: 8px; word-wrap: break-word; box-shadow: 0 1px 2px rgba(27,31,35,0.08); font-size: 0.875rem; }
         .message.sent { background: #ddf4ff; color: #0969da; border: 1px solid #b6e3ff; border-bottom-right-radius: 2px; }
         .message.received { background: #ffffff; color: #24292f; border: 1px solid #e1e4e8; border-bottom-left-radius: 2px; }
+        .message.system { background: #f6f8fa; color: #57606a; border: 1px solid #e1e4e8; font-size: 0.75rem; padding: 0.375rem 0.75rem; font-style: italic; max-width: 90%; }
+        .message.system.join { border-left: 3px solid #2da44e; }
+        .message.system.leave { border-left: 3px solid #cf222e; }
+        .message.system.rename { border-left: 3px solid #0969da; }
+        .message.deleted { opacity: 0.5; font-style: italic; }
         .message-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.25rem; gap: 0.5rem; }
         .message-username { font-weight: 600; font-size: 0.75rem; }
         .message.sent .message-username { color: #0550ae; }
@@ -235,6 +494,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         .modal-message { margin-bottom: 0; color: #57606a; font-size: 0.875rem; word-break: break-word; white-space: pre-wrap; line-height: 1.5; }
         .modal-footer { display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 1rem; flex-wrap: wrap; }
         .warning-icon { font-size: 2.5rem; text-align: center; margin-bottom: 0.75rem; }
+        .participants-list { margin-top: 0.5rem; padding: 0.5rem; background: #f6f8fa; border-radius: 4px; font-size: 0.75rem; }
+        .participant-item { display: flex; align-items: center; gap: 0.375rem; padding: 0.25rem 0; }
+        .participant-dot { width: 8px; height: 8px; border-radius: 50%; background: #2da44e; }
         @media (max-width: 768px) {
             .message { max-width: 85%; font-size: 0.875rem; }
             .input { font-size: 16px; }
@@ -258,7 +520,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <div id="createScreen" style="display: none;">
         <div class="header">
             <div class="logo">🔒 xsukax E2E Encrypted PHP Chat</div>
-            <div class="tagline">End-to-end encrypted • Zero-knowledge • Auto-deletes after 24h</div>
+            <div class="tagline">End-to-end encrypted • Zero-knowledge • Auto-deletes after 24h • Max 2 users</div>
         </div>
         <div class="centered-form">
             <div class="card">
@@ -276,7 +538,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <div id="joinScreen" style="display: none;">
         <div class="header">
             <div class="logo">🔒 xsukax E2E Encrypted PHP Chat</div>
-            <div class="tagline">End-to-end encrypted • Zero-knowledge • Auto-deletes after 24h</div>
+            <div class="tagline">End-to-end encrypted • Zero-knowledge • Auto-deletes after 24h • Max 2 users</div>
         </div>
         <div class="centered-form">
             <div class="card">
@@ -294,13 +556,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </div>
     </div>
 
+    <div id="roomFullScreen" style="display: none;">
+        <div class="header">
+            <div class="logo">🔒 xsukax E2E Encrypted PHP Chat</div>
+            <div class="tagline">End-to-end encrypted • Zero-knowledge • Auto-deletes after 24h • Max 2 users</div>
+        </div>
+        <div class="centered-form">
+            <div class="card" style="text-align: center;">
+                <div style="font-size: 3rem; margin-bottom: 1rem;">🚫</div>
+                <h2 style="font-size: 1.5rem; font-weight: 600; margin-bottom: 0.5rem; color: #cf222e;">Room Full</h2>
+                <p style="color: #57606a; margin-bottom: 1rem;">This chat room already has 2 participants. Please wait for someone to leave or create a new chat.</p>
+                <button onclick="window.location.href=location.pathname" class="btn btn-primary">Create New Chat</button>
+            </div>
+        </div>
+    </div>
+
     <div id="chatScreen" class="chat-screen" style="display: none;">
         <div class="chat-header">
             <div class="chat-header-left">
-                <div class="chat-header-title">xsukax E2E Encrypted PHP Chat</div>
-                <div class="chat-header-subtitle">You: <span id="currentUserName" style="color: #0969da; font-weight: 600;"></span></div>
+                <div class="chat-header-title">🔒 xsukax E2E Encrypted PHP Chat</div>
+                <div class="chat-header-subtitle">
+                    <span>You: <span id="currentUserName" class="user-name-display" onclick="showNicknameModal()" title="Click to change nickname"></span></span>
+                    <span class="participants-badge" id="participantsBadge">1/2 online</span>
+                </div>
             </div>
             <div class="header-actions">
+                <button onclick="showParticipantsModal()" class="btn btn-small">👥 Users</button>
                 <button onclick="copyShareLink()" class="btn btn-small">📋 Share</button>
                 <button onclick="showDestroyModal()" class="btn btn-small btn-danger">💥 Destroy</button>
             </div>
@@ -349,10 +630,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </div>
     </div>
 
+    <div id="nicknameModal" class="modal">
+        <div class="modal-content">
+            <h3 class="modal-title">Change Nickname</h3>
+            <p style="font-size: 0.8rem; color: #57606a; margin-bottom: 0.75rem;">Your nickname is visible to other participants in this chat.</p>
+            <input type="text" id="nicknameInput" class="input" placeholder="Enter new nickname..." maxlength="20">
+            <div class="modal-footer">
+                <button onclick="closeNicknameModal()" class="btn">Cancel</button>
+                <button onclick="saveNickname()" class="btn btn-primary">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="participantsModal" class="modal">
+        <div class="modal-content">
+            <h3 class="modal-title">👥 Online Participants</h3>
+            <div id="participantsList" class="participants-list"></div>
+            <div class="modal-footer">
+                <button onclick="closeParticipantsModal()" class="btn">Close</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         let currentChatId, currentUserId, currentUserName, encryptionKey;
-        let lastMessageId = 0, pollInterval, displayedMessageIds = new Set(), editingMessageId;
-        let confirmCallback = null;
+        let lastMessageId = 0, pollInterval, heartbeatInterval, displayedMessages = new Map();
+        let editingMessageId, confirmCallback = null, participants = [];
+        let messageVersions = {};
+        let hasJoinedRoom = false;
 
         const adjectives = ['Swift', 'Bright', 'Clever', 'Gentle', 'Bold', 'Calm', 'Noble', 'Keen', 'Wise', 'Brave'];
         const nouns = ['Phoenix', 'Dragon', 'Eagle', 'Wolf', 'Tiger', 'Falcon', 'Bear', 'Fox', 'Hawk', 'Lion'];
@@ -364,78 +669,75 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         function getUserId(chatId) {
-            let userId = localStorage.getItem(`user_id_${chatId}`);
-            if (!userId) {
-                userId = crypto.randomUUID();
-                localStorage.setItem(`user_id_${chatId}`, userId);
-            }
-            return userId;
+            let id = localStorage.getItem(`user_id_${chatId}`);
+            if (!id) { id = crypto.randomUUID(); localStorage.setItem(`user_id_${chatId}`, id); }
+            return id;
         }
 
         function getUserName(chatId) {
-            let userName = localStorage.getItem(`user_name_${chatId}`);
-            if (!userName) {
-                userName = generateUserName();
-                localStorage.setItem(`user_name_${chatId}`, userName);
-            }
-            return userName;
+            let name = localStorage.getItem(`user_name_${chatId}`);
+            if (!name) { name = generateUserName(); localStorage.setItem(`user_name_${chatId}`, name); }
+            return name;
         }
 
-        function arrayBufferToBase64(buffer) {
-            const bytes = new Uint8Array(buffer);
-            let binary = '';
-            const chunkSize = 8192;
-            for (let i = 0; i < bytes.length; i += chunkSize) {
-                binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + chunkSize, bytes.length)));
-            }
-            return btoa(binary);
+        function setUserName(chatId, name) {
+            localStorage.setItem(`user_name_${chatId}`, name);
+            currentUserName = name;
+            document.getElementById('currentUserName').textContent = name;
         }
 
-        function base64ToArrayBuffer(base64) {
-            const binary = atob(base64);
-            const bytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        function arrayBufferToBase64(buf) {
+            const bytes = new Uint8Array(buf);
+            let bin = '';
+            for (let i = 0; i < bytes.length; i += 8192) {
+                bin += String.fromCharCode(...bytes.subarray(i, Math.min(i + 8192, bytes.length)));
+            }
+            return btoa(bin);
+        }
+
+        function base64ToArrayBuffer(b64) {
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
             return bytes.buffer;
         }
 
-        async function deriveKey(password, salt) {
-            const encoder = new TextEncoder();
-            const keyMaterial = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveKey']);
+        async function deriveKey(pwd, salt) {
+            const enc = new TextEncoder();
+            const keyMat = await crypto.subtle.importKey('raw', enc.encode(pwd), 'PBKDF2', false, ['deriveKey']);
             return crypto.subtle.deriveKey(
-                { name: 'PBKDF2', salt: encoder.encode(salt), iterations: 100000, hash: 'SHA-256' },
-                keyMaterial,
-                { name: 'AES-GCM', length: 256 },
-                true,
-                ['encrypt', 'decrypt']
+                { name: 'PBKDF2', salt: enc.encode(salt), iterations: 100000, hash: 'SHA-256' },
+                keyMat, { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']
             );
         }
 
-        async function hashPassword(password) {
-            const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(password));
+        async function hashPassword(pwd) {
+            const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pwd));
             return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
         }
 
         async function encrypt(text, key) {
             const iv = crypto.getRandomValues(new Uint8Array(12));
-            const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(text));
-            const combined = new Uint8Array(iv.length + encrypted.byteLength);
+            const enc = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(text));
+            const combined = new Uint8Array(iv.length + enc.byteLength);
             combined.set(iv);
-            combined.set(new Uint8Array(encrypted), iv.length);
+            combined.set(new Uint8Array(enc), iv.length);
             return arrayBufferToBase64(combined.buffer);
         }
 
-        async function decrypt(encryptedData, key) {
+        async function decrypt(encData, key) {
             try {
-                const data = new Uint8Array(base64ToArrayBuffer(encryptedData));
-                const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: data.slice(0, 12) }, key, data.slice(12));
-                return new TextDecoder().decode(decrypted);
+                const data = new Uint8Array(base64ToArrayBuffer(encData));
+                const dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: data.slice(0, 12) }, key, data.slice(12));
+                return new TextDecoder().decode(dec);
             } catch { return null; }
         }
 
         function notify(msg, type = 'info') {
             const n = document.createElement('div');
             n.className = `notification ${type}`;
-            n.innerHTML = `<div style="font-weight: 600; margin-bottom: 0.25rem; font-size: 0.8125rem;">${type === 'success' ? '✓' : type === 'error' ? '✗' : type === 'warning' ? '⚠' : 'ℹ'} ${type.toUpperCase()}</div><div style="font-size: 0.8125rem;">${escapeHtml(msg)}</div>`;
+            const icons = { success: '✔', error: '✗', warning: '⚠', info: 'ℹ' };
+            n.innerHTML = `<div style="font-weight: 600; margin-bottom: 0.25rem; font-size: 0.8125rem;">${icons[type] || 'ℹ'} ${type.toUpperCase()}</div><div style="font-size: 0.8125rem;">${escapeHtml(msg)}</div>`;
             document.body.appendChild(n);
             setTimeout(() => n.remove(), 3500);
         }
@@ -454,9 +756,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             document.getElementById('infoModal').classList.add('active');
         }
 
-        function closeInfoModal() {
-            document.getElementById('infoModal').classList.remove('active');
-        }
+        function closeInfoModal() { document.getElementById('infoModal').classList.remove('active'); }
 
         function showConfirmModal(title, msg, actionText, callback, showWarning = false) {
             document.getElementById('confirmModalIcon').style.display = showWarning ? 'block' : 'none';
@@ -468,17 +768,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             document.getElementById('confirmModal').classList.add('active');
         }
 
-        function closeConfirmModal() {
-            document.getElementById('confirmModal').classList.remove('active');
-            confirmCallback = null;
-        }
-
-        function confirmModalCallback() {
-            if (confirmCallback) {
-                confirmCallback();
-                closeConfirmModal();
-            }
-        }
+        function closeConfirmModal() { document.getElementById('confirmModal').classList.remove('active'); confirmCallback = null; }
+        function confirmModalCallback() { if (confirmCallback) { confirmCallback(); closeConfirmModal(); } }
 
         function showEditModal(id, text) {
             editingMessageId = id;
@@ -486,55 +777,132 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             document.getElementById('editModal').classList.add('active');
         }
 
-        function closeEditModal() {
-            document.getElementById('editModal').classList.remove('active');
+        function closeEditModal() { document.getElementById('editModal').classList.remove('active'); }
+
+        function showNicknameModal() {
+            document.getElementById('nicknameInput').value = currentUserName;
+            document.getElementById('nicknameModal').classList.add('active');
+            document.getElementById('nicknameInput').focus();
         }
 
+        function closeNicknameModal() { document.getElementById('nicknameModal').classList.remove('active'); }
+
+        function showParticipantsModal() {
+            updateParticipantsList();
+            document.getElementById('participantsModal').classList.add('active');
+        }
+
+        function closeParticipantsModal() { document.getElementById('participantsModal').classList.remove('active'); }
+
         function showDestroyModal() {
-            showConfirmModal(
-                'Destroy Chat?',
-                'This will permanently delete this chat and ALL messages for EVERYONE.\n\nThis action CANNOT be undone!',
-                'Destroy Forever',
-                destroyChat,
-                true
-            );
+            showConfirmModal('Destroy Chat?', 'This will permanently delete this chat and ALL messages for EVERYONE.\n\nThis action CANNOT be undone!', 'Destroy Forever', destroyChat, true);
         }
 
         function showDeleteMessageModal(id) {
-            showConfirmModal(
-                'Delete Message?',
-                'Are you sure you want to delete this message?',
-                'Delete',
-                () => deleteMessage(id),
-                false
-            );
+            showConfirmModal('Delete Message?', 'Are you sure you want to delete this message?', 'Delete', () => deleteMessage(id), false);
         }
 
-        async function saveEdit() {
-            const text = document.getElementById('editInput').value.trim();
-            if (!text) {
-                notify('Message cannot be empty', 'error');
+        async function updateParticipantsList() {
+            const list = document.getElementById('participantsList');
+            let html = '';
+            for (const p of participants) {
+                let name = 'Unknown';
+                if (p.encrypted_name) {
+                    try {
+                        const dec = await decrypt(p.encrypted_name, encryptionKey);
+                        if (dec) name = dec;
+                    } catch {}
+                }
+                const isYou = p.user_id === currentUserId;
+                html += `<div class="participant-item"><span class="participant-dot"></span><span>${escapeHtml(name)}${isYou ? ' (you)' : ''}</span></div>`;
+            }
+            list.innerHTML = html || '<div style="color: #57606a;">No participants</div>';
+        }
+
+        function updateParticipantsBadge() {
+            document.getElementById('participantsBadge').textContent = `${participants.length}/2 online`;
+        }
+
+        async function saveNickname() {
+            const newName = document.getElementById('nicknameInput').value.trim();
+            if (!newName || newName.length < 1 || newName.length > 20) {
+                notify('Nickname must be 1-20 characters', 'error');
                 return;
             }
+            const oldName = currentUserName;
+            if (newName === oldName) { closeNicknameModal(); return; }
 
             try {
-                const encrypted = await encrypt(JSON.stringify({ text, userName: currentUserName }), encryptionKey);
+                const encName = await encrypt(newName, encryptionKey);
+                const renameMsg = await encrypt(JSON.stringify({ type: 'rename', oldName, newName }), encryptionKey);
+                
                 const fd = new FormData();
-                fd.append('action', 'edit_message');
-                fd.append('message_id', editingMessageId);
+                fd.append('action', 'update_nickname');
+                fd.append('chat_id', currentChatId);
                 fd.append('user_id', currentUserId);
-                fd.append('encrypted_content', encrypted);
+                fd.append('encrypted_name', encName);
+                fd.append('encrypted_rename_msg', renameMsg);
                 
                 const res = await fetch('', { method: 'POST', body: fd });
                 const data = await res.json();
                 
                 if (data.success) {
+                    setUserName(currentChatId, newName);
+                    closeNicknameModal();
+                    notify('Nickname changed to ' + newName, 'success');
+                } else {
+                    notify('Failed to update nickname', 'error');
+                }
+            } catch (e) {
+                notify('Error: ' + e.message, 'error');
+            }
+        }
+
+        async function saveEdit() {
+            const text = document.getElementById('editInput').value.trim();
+            if (!text) { notify('Message cannot be empty', 'error'); return; }
+
+            try {
+                const enc = await encrypt(JSON.stringify({ text, userName: currentUserName }), encryptionKey);
+                const fd = new FormData();
+                fd.append('action', 'edit_message');
+                fd.append('message_id', editingMessageId);
+                fd.append('user_id', currentUserId);
+                fd.append('encrypted_content', enc);
+                
+                const res = await fetch('', { method: 'POST', body: fd });
+                const data = await res.json();
+                
+                if (data.success) {
+                    messageVersions[editingMessageId] = data.version;
+                    
+                    // Update DOM immediately for the editing user
+                    const msgEl = document.getElementById(`msg-${editingMessageId}`);
+                    if (msgEl) {
+                        msgEl.querySelector('.message-text').textContent = text;
+                        
+                        // Update the Edit button's onclick with new text
+                        const editBtn = msgEl.querySelector('.message-actions button:first-child');
+                        if (editBtn) {
+                            editBtn.onclick = () => showEditModal(editingMessageId, text);
+                        }
+                        
+                        // Add (edited) label if not already present
+                        if (!msgEl.querySelector('.message-edited')) {
+                            const editedDiv = document.createElement('div');
+                            editedDiv.className = 'message-edited';
+                            editedDiv.textContent = '(edited)';
+                            const actions = msgEl.querySelector('.message-actions');
+                            if (actions) {
+                                msgEl.querySelector('.message').insertBefore(editedDiv, actions);
+                            } else {
+                                msgEl.querySelector('.message').appendChild(editedDiv);
+                            }
+                        }
+                    }
+                    
                     notify('Message updated', 'success');
                     closeEditModal();
-                    displayedMessageIds.clear();
-                    lastMessageId = 0;
-                    document.getElementById('messagesContainer').innerHTML = '';
-                    loadMessages();
                 } else {
                     notify('Failed to update message', 'error');
                 }
@@ -554,11 +922,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 const data = await res.json();
                 
                 if (data.success) {
+                    messageVersions[id] = data.version;
+                    
+                    // Update DOM immediately for the deleting user
+                    const msgEl = document.getElementById(`msg-${id}`);
+                    if (msgEl) {
+                        const bubble = msgEl.querySelector('.message');
+                        bubble.classList.add('deleted');
+                        msgEl.querySelector('.message-text').textContent = '[Message deleted]';
+                        const actions = msgEl.querySelector('.message-actions');
+                        if (actions) actions.remove();
+                        const edited = msgEl.querySelector('.message-edited');
+                        if (edited) edited.remove();
+                    }
+                    
                     notify('Message deleted', 'success');
-                    displayedMessageIds.clear();
-                    lastMessageId = 0;
-                    document.getElementById('messagesContainer').innerHTML = '';
-                    loadMessages();
                 } else {
                     notify('Failed to delete message', 'error');
                 }
@@ -569,10 +947,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         async function createChat() {
             const pwd = document.getElementById('createPassword').value;
-            if (!pwd || pwd.length < 8) {
-                notify('Password must be 8+ characters', 'error');
-                return;
-            }
+            if (!pwd || pwd.length < 8) { notify('Password must be 8+ characters', 'error'); return; }
 
             try {
                 const fd = new FormData();
@@ -588,8 +963,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     currentUserName = getUserName(currentChatId);
                     encryptionKey = await deriveKey(pwd, currentChatId);
                     
+                    await joinRoom();
+                    
                     const url = `${location.origin}${location.pathname}?chat=${currentChatId}`;
-                    showInfoModal('Chat Created!', `Share this link:\n\n${url}\n\nExpires in 24 hours.`, 'Copy Link', () => {
+                    showInfoModal('Chat Created!', `Share this link:\n\n${url}\n\nExpires in 24 hours. Max 2 users.`, 'Copy Link', () => {
                         navigator.clipboard.writeText(url);
                         notify('Link copied to clipboard', 'success');
                         closeInfoModal();
@@ -606,31 +983,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         async function joinChat() {
             const pwd = document.getElementById('joinPassword').value;
-            if (!pwd) {
-                notify('Please enter password', 'error');
-                return;
-            }
+            if (!pwd) { notify('Please enter password', 'error'); return; }
 
             try {
+                currentChatId = document.getElementById('joinChatId').value;
+                currentUserId = getUserId(currentChatId);
+                
                 const fd = new FormData();
                 fd.append('action', 'verify_chat');
-                fd.append('chat_id', document.getElementById('joinChatId').value);
+                fd.append('chat_id', currentChatId);
+                fd.append('user_id', currentUserId);
                 fd.append('password_hash', await hashPassword(pwd));
                 
                 const res = await fetch('', { method: 'POST', body: fd });
                 const data = await res.json();
                 
                 if (data.success) {
-                    currentChatId = document.getElementById('joinChatId').value;
-                    currentUserId = getUserId(currentChatId);
                     currentUserName = getUserName(currentChatId);
                     encryptionKey = await deriveKey(pwd, currentChatId);
-                    showChatScreen();
+                    
+                    await joinRoom();
+                    
                     notify('Successfully joined chat', 'success');
                     if (data.remaining_time < 3600) {
                         document.getElementById('expiryWarning').textContent = `⚠️ Chat expires in ${Math.floor(data.remaining_time / 60)} minutes`;
                         document.getElementById('expiryWarning').style.display = 'block';
                     }
+                    showChatScreen();
+                } else if (data.error === 'Room is full (max 2 users)') {
+                    document.getElementById('joinScreen').style.display = 'none';
+                    document.getElementById('roomFullScreen').style.display = 'block';
                 } else {
                     notify(data.error || 'Failed to join chat', 'error');
                 }
@@ -639,13 +1021,80 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
 
+        async function joinRoom(sendNotification = true) {
+            try {
+                const encName = await encrypt(currentUserName, encryptionKey);
+                const fd = new FormData();
+                fd.append('action', 'join_room');
+                fd.append('chat_id', currentChatId);
+                fd.append('user_id', currentUserId);
+                fd.append('encrypted_name', encName);
+                
+                // Only send join notification on first join
+                if (sendNotification && !hasJoinedRoom) {
+                    const joinMsg = await encrypt(JSON.stringify({ type: 'join', userName: currentUserName }), encryptionKey);
+                    fd.append('encrypted_join_msg', joinMsg);
+                }
+                
+                const res = await fetch('', { method: 'POST', body: fd });
+                const data = await res.json();
+                
+                if (data.success) {
+                    hasJoinedRoom = true;
+                    participants = data.participants || [];
+                    updateParticipantsBadge();
+                } else if (data.error === 'Room is full') {
+                    document.getElementById('joinScreen').style.display = 'none';
+                    document.getElementById('roomFullScreen').style.display = 'block';
+                    throw new Error('Room is full');
+                }
+            } catch (e) {
+                throw e;
+            }
+        }
+
+        async function leaveRoom() {
+            if (!hasJoinedRoom) return;
+            try {
+                const leaveMsg = await encrypt(JSON.stringify({ type: 'leave', userName: currentUserName }), encryptionKey);
+                const fd = new FormData();
+                fd.append('action', 'leave_room');
+                fd.append('chat_id', currentChatId);
+                fd.append('user_id', currentUserId);
+                fd.append('encrypted_leave_msg', leaveMsg);
+                navigator.sendBeacon('', fd);
+                hasJoinedRoom = false;
+            } catch {}
+        }
+
+        async function sendHeartbeat() {
+            try {
+                const encName = await encrypt(currentUserName, encryptionKey);
+                const fd = new FormData();
+                fd.append('action', 'heartbeat');
+                fd.append('chat_id', currentChatId);
+                fd.append('user_id', currentUserId);
+                fd.append('encrypted_name', encName);
+                
+                const res = await fetch('', { method: 'POST', body: fd });
+                const data = await res.json();
+                
+                if (data.success) {
+                    participants = data.participants || [];
+                    updateParticipantsBadge();
+                }
+            } catch {}
+        }
+
         function showChatScreen() {
             document.getElementById('createScreen').style.display = 'none';
             document.getElementById('joinScreen').style.display = 'none';
+            document.getElementById('roomFullScreen').style.display = 'none';
             document.getElementById('chatScreen').style.display = 'flex';
             document.getElementById('currentUserName').textContent = currentUserName;
             loadMessages();
             pollInterval = setInterval(loadMessages, 2000);
+            heartbeatInterval = setInterval(sendHeartbeat, 10000);
         }
 
         function copyShareLink() {
@@ -664,14 +1113,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 
                 if (data.success) {
                     if (pollInterval) clearInterval(pollInterval);
+                    if (heartbeatInterval) clearInterval(heartbeatInterval);
                     localStorage.removeItem(`user_id_${currentChatId}`);
                     localStorage.removeItem(`user_name_${currentChatId}`);
                     
                     showInfoModal('Chat Destroyed', 'This chat has been permanently deleted from the database.', null, null);
-                    
-                    setTimeout(() => {
-                        window.location.href = location.pathname;
-                    }, 2000);
+                    setTimeout(() => { window.location.href = location.pathname; }, 2000);
                 } else {
                     notify(data.error || 'Failed to destroy chat', 'error');
                 }
@@ -686,16 +1133,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (!msg) return;
 
             try {
-                const encrypted = await encrypt(JSON.stringify({ text: msg, userName: currentUserName }), encryptionKey);
+                const enc = await encrypt(JSON.stringify({ text: msg, userName: currentUserName }), encryptionKey);
                 const fd = new FormData();
                 fd.append('action', 'send_message');
                 fd.append('chat_id', currentChatId);
                 fd.append('user_id', currentUserId);
-                fd.append('encrypted_content', encrypted);
+                fd.append('encrypted_content', enc);
                 
-                await fetch('', { method: 'POST', body: fd });
-                input.value = '';
-                setTimeout(loadMessages, 100);
+                const res = await fetch('', { method: 'POST', body: fd });
+                const data = await res.json();
+                
+                if (data.success) {
+                    input.value = '';
+                    setTimeout(loadMessages, 100);
+                }
             } catch (e) {
                 notify('Failed to send message', 'error');
             }
@@ -707,72 +1158,61 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 fd.append('action', 'get_messages');
                 fd.append('chat_id', currentChatId);
                 fd.append('last_id', lastMessageId);
+                fd.append('known_versions', JSON.stringify(messageVersions));
                 
                 const res = await fetch('', { method: 'POST', body: fd });
                 const data = await res.json();
                 
-                if (data.success && data.messages.length) {
-                    const container = document.getElementById('messagesContainer');
-                    const shouldScroll = container.scrollHeight - container.scrollTop <= container.clientHeight + 100;
-                    
+                if (!data.success) return;
+                
+                const container = document.getElementById('messagesContainer');
+                const shouldScroll = container.scrollHeight - container.scrollTop <= container.clientHeight + 100;
+                
+                // Handle updates to existing messages
+                if (data.updates && data.updates.length > 0) {
+                    for (const msg of data.updates) {
+                        messageVersions[msg.id] = msg.version;
+                        const existingEl = document.getElementById(`msg-${msg.id}`);
+                        if (existingEl) {
+                            if (msg.deleted) {
+                                existingEl.querySelector('.message').classList.add('deleted');
+                                existingEl.querySelector('.message-text').textContent = '[Message deleted]';
+                                const actions = existingEl.querySelector('.message-actions');
+                                if (actions) actions.remove();
+                                const edited = existingEl.querySelector('.message-edited');
+                                if (edited) edited.remove();
+                            } else if (msg.edited) {
+                                const dec = await decrypt(msg.encrypted_content, encryptionKey);
+                                if (dec) {
+                                    let msgData;
+                                    try { msgData = JSON.parse(dec); } catch { msgData = { text: dec }; }
+                                    existingEl.querySelector('.message-text').textContent = msgData.text;
+                                    if (!existingEl.querySelector('.message-edited')) {
+                                        const editedDiv = document.createElement('div');
+                                        editedDiv.className = 'message-edited';
+                                        editedDiv.textContent = '(edited)';
+                                        existingEl.querySelector('.message').insertBefore(editedDiv, existingEl.querySelector('.message-actions'));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Handle new messages
+                if (data.messages && data.messages.length > 0) {
                     for (const msg of data.messages) {
-                        if (displayedMessageIds.has(msg.id)) continue;
+                        if (displayedMessages.has(msg.id)) continue;
                         
-                        const decrypted = await decrypt(msg.encrypted_content, encryptionKey);
-                        if (!decrypted) { 
-                            displayedMessageIds.add(msg.id); 
-                            continue; 
+                        messageVersions[msg.id] = msg.version;
+                        
+                        if (msg.msg_type === 'join' || msg.msg_type === 'leave' || msg.msg_type === 'rename') {
+                            await renderSystemMessage(msg, container);
+                        } else if (!msg.deleted) {
+                            await renderUserMessage(msg, container);
                         }
                         
-                        let msgData;
-                        try {
-                            msgData = JSON.parse(decrypted);
-                        } catch {
-                            msgData = { text: decrypted, userName: 'User' };
-                        }
-                        
-                        const isMine = msg.user_id === currentUserId;
-                        const wrapper = document.createElement('div');
-                        wrapper.className = `message-wrapper ${isMine ? 'sent' : 'received'}`;
-                        
-                        const bubble = document.createElement('div');
-                        bubble.className = `message ${isMine ? 'sent' : 'received'}`;
-                        
-                        const header = document.createElement('div');
-                        header.className = 'message-header';
-                        header.innerHTML = `
-                            <span class="message-username">${escapeHtml(msgData.userName || 'Anonymous')}</span>
-                            <span class="message-time">${new Date(msg.timestamp * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
-                        `;
-                        
-                        const textDiv = document.createElement('div');
-                        textDiv.className = 'message-text';
-                        textDiv.textContent = msgData.text;
-                        
-                        bubble.appendChild(header);
-                        bubble.appendChild(textDiv);
-                        
-                        if (msg.edited) {
-                            const editedDiv = document.createElement('div');
-                            editedDiv.className = 'message-edited';
-                            editedDiv.textContent = '(edited)';
-                            bubble.appendChild(editedDiv);
-                        }
-                        
-                        if (isMine) {
-                            const actions = document.createElement('div');
-                            actions.className = 'message-actions';
-                            actions.innerHTML = `
-                                <button onclick="showEditModal(${msg.id}, ${JSON.stringify(msgData.text).replace(/"/g, '&quot;')})" class="btn btn-small">✏️ Edit</button>
-                                <button onclick="showDeleteMessageModal(${msg.id})" class="btn btn-small btn-danger">🗑️</button>
-                            `;
-                            bubble.appendChild(actions);
-                        }
-                        
-                        wrapper.appendChild(bubble);
-                        container.appendChild(wrapper);
-                        
-                        displayedMessageIds.add(msg.id);
+                        displayedMessages.set(msg.id, msg.version);
                         lastMessageId = Math.max(lastMessageId, msg.id);
                     }
                     
@@ -781,6 +1221,85 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             } catch (e) {
                 console.error('Load messages error:', e);
             }
+        }
+
+        async function renderSystemMessage(msg, container) {
+            const dec = await decrypt(msg.encrypted_content, encryptionKey);
+            if (!dec) return;
+            
+            let sysData, text = '';
+            try {
+                sysData = JSON.parse(dec);
+                if (sysData.type === 'join') {
+                    text = `${sysData.userName} joined the chat`;
+                } else if (sysData.type === 'leave') {
+                    text = `${sysData.userName} left the chat`;
+                } else if (sysData.type === 'timeout_leave') {
+                    const name = await decrypt(sysData.encrypted_name, encryptionKey);
+                    text = `${name || 'A user'} disconnected`;
+                } else if (sysData.type === 'rename') {
+                    text = `${sysData.oldName} changed their name to ${sysData.newName}`;
+                }
+            } catch {
+                text = dec;
+            }
+            
+            if (!text) return;
+            
+            const wrapper = document.createElement('div');
+            wrapper.className = 'message-wrapper system';
+            wrapper.id = `msg-${msg.id}`;
+            
+            const bubble = document.createElement('div');
+            bubble.className = `message system ${msg.msg_type}`;
+            bubble.innerHTML = `<span>${escapeHtml(text)}</span> <span class="message-time">${new Date(msg.timestamp * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>`;
+            
+            wrapper.appendChild(bubble);
+            container.appendChild(wrapper);
+        }
+
+        async function renderUserMessage(msg, container) {
+            const dec = await decrypt(msg.encrypted_content, encryptionKey);
+            if (!dec) return;
+            
+            let msgData;
+            try { msgData = JSON.parse(dec); } catch { msgData = { text: dec, userName: 'User' }; }
+            
+            const isMine = msg.user_id === currentUserId;
+            const wrapper = document.createElement('div');
+            wrapper.className = `message-wrapper ${isMine ? 'sent' : 'received'}`;
+            wrapper.id = `msg-${msg.id}`;
+            
+            const bubble = document.createElement('div');
+            bubble.className = `message ${isMine ? 'sent' : 'received'}`;
+            
+            bubble.innerHTML = `
+                <div class="message-header">
+                    <span class="message-username">${escapeHtml(msgData.userName || 'Anonymous')}</span>
+                    <span class="message-time">${new Date(msg.timestamp * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
+                </div>
+                <div class="message-text">${escapeHtml(msgData.text)}</div>
+            `;
+            
+            if (msg.edited) {
+                const editedDiv = document.createElement('div');
+                editedDiv.className = 'message-edited';
+                editedDiv.textContent = '(edited)';
+                bubble.appendChild(editedDiv);
+            }
+            
+            if (isMine) {
+                const actions = document.createElement('div');
+                actions.className = 'message-actions';
+                actions.innerHTML = `
+                    <button onclick="showEditModal(${msg.id}, ${JSON.stringify(msgData.text).replace(/"/g, '&quot;')})" class="btn btn-small">✏️ Edit</button>
+                    <button onclick="showDeleteMessageModal(${msg.id})" class="btn btn-small btn-danger">🗑️</button>
+                `;
+                bubble.appendChild(actions);
+            }
+            
+            wrapper.appendChild(bubble);
+            container.appendChild(wrapper);
         }
 
         function escapeHtml(text) {
@@ -801,6 +1320,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         window.addEventListener('beforeunload', () => {
             if (pollInterval) clearInterval(pollInterval);
+            if (heartbeatInterval) clearInterval(heartbeatInterval);
+            if (currentChatId && currentUserId) leaveRoom();
+        });
+
+        // Only pause/resume heartbeat on visibility change, don't leave/rejoin
+        window.addEventListener('visibilitychange', () => {
+            if (!currentChatId || !encryptionKey) return;
+            
+            if (document.visibilityState === 'visible') {
+                // Resume polling and heartbeat when tab becomes visible
+                if (!pollInterval) {
+                    loadMessages();
+                    pollInterval = setInterval(loadMessages, 2000);
+                }
+                if (!heartbeatInterval) {
+                    sendHeartbeat();
+                    heartbeatInterval = setInterval(sendHeartbeat, 10000);
+                }
+            } else {
+                // Optionally slow down polling when hidden (but don't leave)
+                // The heartbeat will keep presence alive
+            }
         });
     </script>
 </body>
