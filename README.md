@@ -1,326 +1,435 @@
 # 🔒 xsukax E2E Encrypted PHP Chat
 
-A lightweight, self-hosted end-to-end encrypted chat application built with PHP and vanilla JavaScript. Zero dependencies, zero knowledge architecture, with automatic message destruction after 24 hours.
+A secure, self-hosted, end-to-end encrypted chat application built with PHP and vanilla JavaScript. This zero-knowledge chat system ensures that your conversations remain private, with messages encrypted client-side before transmission and automatic cleanup after 24 hours.
 
-## 📋 Project Overview
+**Demo:** [https://xsukax.net/chat](https://xsukax.net/chat)
 
-xsukax E2E Encrypted PHP Chat is a privacy-focused, ephemeral messaging platform that enables secure real-time communication between multiple participants. The application implements client-side encryption ensuring that the server never has access to message content in plaintext. Built as a single-file PHP application with embedded HTML, CSS, and JavaScript, it requires minimal infrastructure while providing robust security guarantees.
+## Project Overview
 
-The application creates temporary chat rooms that automatically expire after 24 hours, with all messages permanently deleted from the database. Each participant is assigned a randomly generated pseudonym, and all cryptographic operations occur in the browser using the Web Crypto API.
+xsukax E2E Encrypted PHP Chat is a lightweight, privacy-focused messaging application designed for secure, ephemeral conversations between two participants. Built as a single PHP file with no external dependencies, it provides enterprise-grade encryption while maintaining simplicity and ease of deployment.
 
-## 🛡️ Security and Privacy Benefits
+The application implements true end-to-end encryption where the server never has access to decryption keys or plaintext messages. All cryptographic operations occur in the browser using the Web Crypto API, ensuring that even the server administrator cannot access conversation contents.
 
-### End-to-End Encryption
-- **Client-Side Encryption**: All messages are encrypted in the browser using AES-GCM 256-bit encryption before transmission to the server
-- **Zero-Knowledge Architecture**: The server stores only encrypted ciphertext and cannot decrypt messages under any circumstances
-- **Password-Based Key Derivation**: Encryption keys are derived using PBKDF2 with 100,000 iterations and SHA-256 hashing
-- **Unique Initialization Vectors**: Each message uses a cryptographically random 12-byte IV to prevent pattern analysis
+### Key Characteristics
 
-### Privacy Protection
-- **No Registration Required**: Users access chats anonymously without email addresses, phone numbers, or personal information
-- **Pseudonymous Identity**: Each participant receives a randomly generated username (e.g., "SwiftPhoenix742") that persists only for the chat session
-- **Automatic Data Destruction**: All chats and messages are permanently deleted from the database after 24 hours
-- **Local-Only Identifiers**: User IDs and preferences are stored exclusively in browser localStorage and never transmitted to the server
+- **Single-file deployment**: The entire application exists in one `index.php` file
+- **Zero-knowledge architecture**: Server cannot decrypt messages or access conversation content
+- **Ephemeral messaging**: All chats automatically expire and are permanently deleted after 24 hours
+- **Two-participant rooms**: Designed for secure one-on-one conversations
+- **SQLite backend**: Lightweight, serverless database with no configuration required
+- **No external dependencies**: Pure PHP and vanilla JavaScript implementation
 
-### Database Security
-- **Argon2id Password Hashing**: Chat passwords are hashed server-side using Argon2id (modern, memory-hard algorithm resistant to GPU attacks)
-- **Prepared Statements**: All database queries use SQLite3 prepared statements to prevent SQL injection attacks
-- **Minimal Data Retention**: Only chat ID, password hash, encrypted messages, timestamps, and edit flags are stored
+## Security and Privacy Benefits
 
-### Transport Security
-- **HTTPS Recommended**: While the application functions over HTTP, deployment behind HTTPS is strongly recommended to prevent man-in-the-middle attacks
-- **No Third-Party Dependencies**: Eliminates supply chain vulnerabilities by using only browser-native APIs and PHP standard library
+### Client-Side Encryption
 
-## ✨ Features and Advantages
+All encryption and decryption operations occur exclusively in the user's browser using the Web Crypto API. Messages are encrypted with AES-256-GCM before transmission, ensuring that plaintext content never traverses the network or reaches the server.
 
-### Core Functionality
-- **Real-Time Messaging**: Messages appear instantly for all participants with 2-second polling interval
-- **Multi-User Support**: Unlimited participants can join a single chat room with the chat ID and password
-- **Message Editing**: Users can edit their own messages with edit history indicator
-- **Message Deletion**: Users can delete their own messages at any time
-- **Chat Destruction**: Any participant can permanently destroy the entire chat room for all users
+**Key Derivation**: The application uses PBKDF2 with 100,000 iterations and SHA-256 hashing to derive encryption keys from user passwords. The chat ID serves as a unique salt, ensuring that identical passwords generate different keys across different chat rooms.
 
-### User Experience
-- **Single-File Architecture**: Entire application contained in one `index.php` file for trivial deployment
-- **Responsive Design**: Mobile-optimized interface with safe area support for notched devices
-- **Minimal UI**: Clean, GitHub-inspired interface focused on usability
-- **Browser Compatibility**: Works in all modern browsers supporting Web Crypto API (Chrome, Firefox, Safari, Edge)
-- **No External Assets**: All CSS and JavaScript embedded; no CDN dependencies for core functionality
+### Zero-Knowledge Architecture
 
-### Operational Benefits
-- **Low Resource Requirements**: Runs on minimal PHP hosting with SQLite support
-- **No External Database**: Uses SQLite file-based database (no MySQL/PostgreSQL required)
-- **Automatic Cleanup**: Background process removes expired chats and messages
-- **Share Links**: One-click generation of shareable chat URLs
-- **Expiration Warnings**: Users notified when chat has less than 1 hour remaining
+The server stores only encrypted content and has no mechanism to decrypt messages. Password verification uses Argon2id hashing on the server side, but the actual encryption key remains exclusively in client memory and is never transmitted.
 
-### Privacy Advantages
-- **No Metadata Collection**: Server logs no IP addresses, user agents, or behavioral data
-- **Ephemeral by Design**: 24-hour lifespan prevents long-term data accumulation
-- **Self-Hosted Control**: You maintain complete control over data and infrastructure
-- **Open Source Transparency**: Full source code available for security audit
+**What the server knows:**
+- Chat ID (a random identifier)
+- Hashed passwords (for authentication, not encryption)
+- Encrypted message payloads
+- Message metadata (timestamps, user IDs)
 
-## 🚀 Installation Instructions
+**What the server cannot access:**
+- Message plaintext
+- Encryption keys
+- Actual usernames (encrypted client-side)
+- Any decryptable conversation content
+
+### Automatic Data Destruction
+
+All chat rooms and their associated messages are automatically purged from the database 24 hours after creation. This ephemeral design ensures that sensitive conversations have a limited lifetime and cannot be recovered after expiration.
+
+### Session Isolation
+
+Each chat generates a unique random identifier and maintains user-specific IDs stored in browser localStorage. Sessions are isolated, and inactive participants are automatically removed after 30 seconds of inactivity to prevent unauthorized access.
+
+### Secure Communication Features
+
+- **Message versioning**: Edit and delete operations are tracked with version numbers to prevent replay attacks
+- **Participant verification**: Real-time heartbeat system ensures only active users remain in chat rooms
+- **Room capacity limits**: Maximum of two participants prevents unauthorized joining
+- **Password-protected rooms**: Each chat requires a password for access, with Argon2id hashing for verification
+
+## Features and Advantages
+
+### Core Capabilities
+
+- ✅ **End-to-end encryption** using AES-256-GCM with Web Crypto API
+- ✅ **Real-time messaging** with 2-second polling for instant message delivery
+- ✅ **Message editing** with full encryption of edited content
+- ✅ **Message deletion** with permanent removal from all clients
+- ✅ **Custom nicknames** with encrypted storage and change notifications
+- ✅ **Join/leave notifications** to track participant presence
+- ✅ **Participant list** showing active users in real-time
+- ✅ **Room sharing** via secure shareable links
+- ✅ **Complete chat destruction** allowing permanent deletion before expiration
+- ✅ **Responsive design** optimized for mobile and desktop devices
+- ✅ **No registration required** - instant anonymous chat creation
+
+### Technical Advantages
+
+- **Lightweight footprint**: Single 68KB file with no external dependencies
+- **Easy deployment**: Upload one PHP file to any web server
+- **No configuration**: SQLite database created automatically
+- **Framework-free**: Pure PHP and vanilla JavaScript
+- **Standards-compliant**: Uses Web Crypto API and modern web standards
+- **Cross-platform**: Works on any device with a modern browser
+- **Self-hosted**: Full control over your data and infrastructure
+
+### User Experience Benefits
+
+- **Intuitive interface**: Clean, GitHub-inspired design with clear navigation
+- **Random usernames**: Automatic generation of memorable pseudonyms
+- **Expiration warnings**: Visual alerts when chat lifetime is running low
+- **Copy-to-clipboard**: One-click sharing of secure chat links
+- **Modal confirmations**: Protective warnings for destructive actions
+- **Mobile-optimized**: Touch-friendly interface with safe area support
+
+## Installation Instructions
 
 ### Prerequisites
-- PHP 7.4 or higher (PHP 8.0+ recommended)
-- SQLite3 PHP extension enabled
-- Web server (Apache, Nginx, or PHP built-in server)
-- HTTPS certificate (recommended for production)
+
+- PHP 7.4 or higher with SQLite3 extension enabled
+- Web server (Apache, Nginx, or any PHP-compatible server)
+- HTTPS enabled (recommended for secure Web Crypto API usage)
 
 ### Installation Steps
 
-1. **Clone the Repository**
+1. **Download the application**
    ```bash
-   git clone https://github.com/xsukax/xsukax-E2E-Encrypted-PHP-Chat.git
-   cd xsukax-E2E-Encrypted-PHP-Chat
+   wget https://raw.githubusercontent.com/xsukax/xsukax-E2E-Encrypted-PHP-Chat/main/index.php
    ```
 
-2. **Verify PHP and SQLite3**
-   ```bash
-   php -v
-   php -m | grep sqlite3
-   ```
-   If SQLite3 is not listed, install it:
-   ```bash
-   # Debian/Ubuntu
-   sudo apt install php-sqlite3
+2. **Upload to your web server**
    
-   # CentOS/RHEL
-   sudo yum install php-sqlite3
+   Place `index.php` in your web server's document root or any accessible directory:
+   ```bash
+   # Example for Apache
+   cp index.php /var/www/html/chat/
    
-   # macOS (Homebrew)
-   brew install php
+   # Example for Nginx
+   cp index.php /usr/share/nginx/html/chat/
    ```
 
-3. **Set File Permissions**
+3. **Set appropriate permissions**
    ```bash
    chmod 644 index.php
-   # Ensure web server can write database file
-   chmod 755 .
+   chmod 755 /var/www/html/chat  # Directory must be writable for SQLite
    ```
 
-4. **Configure Web Server**
-
-   **Apache** (`.htaccess` example):
-   ```apache
-   RewriteEngine On
-   RewriteCond %{REQUEST_FILENAME} !-f
-   RewriteRule ^.*$ index.php [L,QSA]
-   ```
-
-   **Nginx** (server block example):
-   ```nginx
-   location / {
-       try_files $uri $uri/ /index.php?$query_string;
-   }
+4. **Verify PHP configuration**
    
-   location ~ \.php$ {
-       fastcgi_pass unix:/var/run/php/php8.1-fpm.sock;
-       fastcgi_index index.php;
-       include fastcgi_params;
-   }
+   Ensure the SQLite3 extension is enabled in your `php.ini`:
+   ```ini
+   extension=sqlite3
    ```
 
-5. **Deploy to Web Server**
-   - Upload `index.php` to your web server document root
-   - Access via browser: `https://yourdomain.com/`
-
-6. **Quick Test with PHP Built-in Server** (Development Only)
-   ```bash
-   php -S localhost:8000
-   # Open browser to http://localhost:8000
+5. **Access the application**
+   
+   Navigate to your installation URL in a web browser:
+   ```
+   https://yourdomain.com/chat/index.php
    ```
 
-### Docker Deployment (Optional)
+### Server Configuration (Optional)
 
-Create a `Dockerfile`:
-```dockerfile
-FROM php:8.1-apache
-RUN docker-php-ext-install pdo pdo_sqlite
-COPY index.php /var/www/html/
-RUN chown -R www-data:www-data /var/www/html
-EXPOSE 80
+For cleaner URLs, configure URL rewriting:
+
+**Apache (.htaccess)**
+```apache
+RewriteEngine On
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteRule ^(.*)$ index.php [QSA,L]
 ```
 
-Build and run:
-```bash
-docker build -t xsukax-chat .
-docker run -d -p 8080:80 xsukax-chat
+**Nginx**
+```nginx
+location /chat {
+    try_files $uri $uri/ /chat/index.php?$query_string;
+}
 ```
 
-## 📖 Usage Guide
+### Security Recommendations
+
+1. **Enable HTTPS**: Web Crypto API requires secure contexts
+2. **Set appropriate file permissions**: Prevent unauthorized modifications
+3. **Configure PHP security**:
+   ```ini
+   expose_php = Off
+   display_errors = Off
+   log_errors = On
+   ```
+4. **Implement rate limiting**: Prevent abuse at the web server level
+5. **Regular backups**: Although chats expire, backup the SQLite database periodically
+
+## Usage Guide
 
 ### Creating a New Chat
 
-1. **Access the Application**
-   - Navigate to your deployed application URL
-   - The "Create New Chat" screen appears by default
+```mermaid
+sequenceDiagram
+    participant User
+    participant Browser
+    participant Server
+    
+    User->>Browser: Enter password (8+ chars)
+    Browser->>Browser: Hash password with SHA-256
+    Browser->>Server: POST create_chat with password hash
+    Server->>Server: Generate random chat ID
+    Server->>Server: Hash password with Argon2id
+    Server->>Server: Store chat in database
+    Server->>Browser: Return chat ID
+    Browser->>Browser: Derive AES-256 key from password
+    Browser->>User: Display shareable link
+```
 
-2. **Set a Strong Password**
-   - Enter a password of at least 8 characters
-   - **Important**: This password is used for both:
-     - Server-side chat authentication (Argon2id hashed)
-     - Client-side message encryption (PBKDF2 key derivation)
-   - Share this password securely with intended participants (use a separate secure channel)
-
-3. **Create the Chat**
-   - Click "Create Secure Chat"
-   - A unique Chat ID is generated (e.g., `a3f9c8e2b1d4567890abcdef12345678`)
-   - Copy the share link provided in the modal
-
-4. **Share with Participants**
-   - Send the share link to other participants via secure channels (Signal, encrypted email, etc.)
-   - Share the password separately for defense-in-depth
+**Steps:**
+1. Navigate to the application URL
+2. Enter a strong password (minimum 8 characters)
+3. Click "Create Secure Chat"
+4. Share the generated link and password with your intended recipient
+5. Wait for the other participant to join
 
 ### Joining an Existing Chat
 
-1. **Open Share Link**
-   - Click the link provided by the chat creator
-   - The "Join Encrypted Chat" screen appears with Chat ID pre-filled
-
-2. **Enter Password**
-   - Input the chat password
-   - Click "Unlock Chat"
-
-3. **Start Messaging**
-   - Your randomly generated username is displayed (e.g., "BraveWolf512")
-   - Begin sending encrypted messages
-
-### Sending and Managing Messages
-
-- **Send Message**: Type in the input field and press Enter or click "Send"
-- **Edit Message**: Click "✏️ Edit" on your own messages, modify text, and save
-- **Delete Message**: Click "🗑️" on your own messages to permanently remove them
-- **View Edit History**: Messages show "(edited)" indicator when modified
-
-### Chat Management
-
-- **Copy Share Link**: Click "📋 Share" in the header to copy the chat URL
-- **Destroy Chat**: Click "💥 Destroy" to permanently delete the chat for all participants
-  - ⚠️ Warning: This action is irreversible and affects all users
-
-### Security Best Practices
-
-1. **Use Strong Passwords**: Minimum 8 characters; recommend 16+ with mixed case, numbers, and symbols
-2. **Share Passwords Securely**: Never send passwords in the same channel as chat links
-3. **Verify Participants**: Confirm identity through out-of-band communication
-4. **Use HTTPS**: Always access the application over HTTPS in production
-5. **Time-Sensitive Communication**: Remember chats auto-delete after 24 hours
-6. **Clear Browser Data**: Use incognito/private mode or clear localStorage after sensitive conversations
-
-### Application Workflow
-
-```mermaid
-graph TD
-    A[User Visits Application] --> B{Chat Link in URL?}
-    B -->|No| C[Create New Chat Screen]
-    B -->|Yes| D[Join Chat Screen]
-    
-    C --> E[Enter Password 8+ chars]
-    E --> F[Generate Chat ID]
-    F --> G[Derive Encryption Key PBKDF2]
-    G --> H[Store Chat in Database]
-    H --> I[Display Share Link]
-    I --> J[Enter Chat Room]
-    
-    D --> K[Enter Chat Password]
-    K --> L[Verify Password Hash]
-    L -->|Invalid| M[Show Error]
-    L -->|Valid| N[Derive Encryption Key]
-    N --> J
-    
-    J --> O[Receive Encrypted Messages]
-    O --> P[Decrypt with AES-GCM]
-    P --> Q[Display in Chat UI]
-    
-    J --> R[User Types Message]
-    R --> S[Encrypt with AES-GCM]
-    S --> T[Send to Server]
-    T --> U[Store Encrypted in Database]
-    U --> V[Broadcast to All Users]
-    
-    J --> W{User Action}
-    W -->|Edit| X[Modify Message]
-    W -->|Delete| Y[Remove Message]
-    W -->|Destroy| Z[Delete Entire Chat]
-    
-    X --> S
-    Y --> AA[Delete from Database]
-    Z --> AB[Delete All Messages & Chat]
-    
-    style J fill:#e1f5ff
-    style S fill:#ffe1e1
-    style P fill:#e1ffe1
-    style Z fill:#ffe1e1
-```
-
-### Encryption Flow
-
 ```mermaid
 sequenceDiagram
-    participant User as User Browser
-    participant Server as PHP Server
-    participant DB as SQLite Database
+    participant User
+    participant Browser
+    participant Server
     
-    Note over User: Chat Creation
-    User->>User: Enter password
-    User->>User: Hash password (SHA-256)
-    User->>Server: Create chat + password hash
-    Server->>Server: Hash with Argon2id
-    Server->>DB: Store chat ID + hash
-    Server->>User: Return chat ID
-    User->>User: Derive key: PBKDF2(password, chatID, 100k iter)
-    
-    Note over User: Sending Message
-    User->>User: Type message
-    User->>User: Generate random IV (12 bytes)
-    User->>User: Encrypt: AES-GCM-256(message, key, IV)
-    User->>Server: Send encrypted + IV
-    Server->>DB: Store encrypted blob
-    Server->>User: Confirm sent
-    
-    Note over User: Receiving Message
-    Server->>User: Poll for new messages
-    User->>Server: Request messages
-    DB->>Server: Return encrypted messages
-    Server->>User: Send encrypted blobs
-    User->>User: Extract IV from blob
-    User->>User: Decrypt: AES-GCM-256(blob, key, IV)
-    User->>User: Display plaintext message
-    
-    Note over User: Message Editing
-    User->>User: Click edit on own message
-    User->>User: Modify text
-    User->>User: Re-encrypt with new IV
-    User->>Server: Update message + encrypted
-    Server->>DB: Update encrypted content
-    Server->>User: Confirm update
-    
-    Note over User,DB: Auto-Cleanup (24h)
-    Server->>Server: Background cleanup process
-    Server->>DB: Delete chats older than 24h
-    DB->>DB: Cascade delete all messages
+    User->>Browser: Open shared link with chat ID
+    User->>Browser: Enter password
+    Browser->>Browser: Hash password with SHA-256
+    Browser->>Server: POST verify_chat with credentials
+    Server->>Server: Verify password hash with Argon2id
+    Server->>Server: Check room capacity (max 2)
+    Server->>Browser: Grant access if valid
+    Browser->>Browser: Derive encryption key
+    Browser->>Server: POST join_room
+    Browser->>Browser: Load encrypted messages
+    Browser->>User: Display decrypted chat
 ```
 
-## 📄 License
+**Steps:**
+1. Receive the chat link and password from the creator
+2. Open the link in your browser
+3. Enter the shared password
+4. Click "Unlock Chat"
+5. Start messaging securely
+
+### Sending Encrypted Messages
+
+```mermaid
+flowchart TD
+    A[User types message] --> B[Click Send]
+    B --> C[Encrypt with AES-256-GCM]
+    C --> D[Include username in payload]
+    D --> E[POST to server]
+    E --> F[Server stores encrypted data]
+    F --> G[Other clients poll for updates]
+    G --> H[Download encrypted message]
+    H --> I[Decrypt with shared key]
+    I --> J[Display plaintext to recipient]
+```
+
+**Process:**
+1. Type your message in the input field
+2. Press Enter or click "Send"
+3. Message encrypts automatically in your browser
+4. Encrypted payload transmits to server
+5. Other participant's browser fetches and decrypts the message
+6. Message appears in their chat interface
+
+### Message Management
+
+**Editing Messages:**
+1. Click the "✏️ Edit" button on your own message
+2. Modify the text in the modal dialog
+3. Click "Save" to encrypt and update the message
+4. The updated message synchronizes to all participants with an "(edited)" indicator
+
+**Deleting Messages:**
+1. Click the "🗑️" button on your own message
+2. Confirm the deletion in the modal
+3. Message is marked as deleted and displays as "[Message deleted]"
+4. Deletion synchronizes to all participants immediately
+
+**Changing Nickname:**
+1. Click your displayed username in the chat header
+2. Enter a new nickname (1-20 characters)
+3. Click "Save" to update and notify other participants
+4. System message announces the name change
+
+### Chat Room Management
+
+**Viewing Participants:**
+- Click the "👥 Users" button to see active participants
+- Online status indicated by green dots
+- Your username marked with "(you)"
+
+**Sharing the Chat:**
+- Click "📋 Share" to copy the invitation link
+- Manually share the password through a separate secure channel
+- Maximum of 2 participants can join any chat room
+
+**Destroying a Chat:**
+- Click "💥 Destroy" in the chat header
+- Confirm the irreversible action
+- All messages and metadata permanently deleted from the database
+- All participants immediately disconnected
+
+### System Architecture
+
+```mermaid
+graph TB
+    subgraph Client["Client Browser"]
+        A[Web Crypto API] --> B[AES-256-GCM Encryption]
+        B --> C[Encrypted Messages]
+        D[PBKDF2 Key Derivation] --> B
+        E[User Password] --> D
+        F[Chat ID Salt] --> D
+    end
+    
+    subgraph Server["PHP Server"]
+        G[index.php] --> H[SQLite Database]
+        H --> I[Encrypted Messages Table]
+        H --> J[Participants Table]
+        H --> K[Chats Table]
+        L[Argon2id Password Hash] --> K
+    end
+    
+    subgraph Security["Security Layer"]
+        M[HTTPS Transport] --> G
+        N[Heartbeat Monitor] --> J
+        O[24h Auto-Cleanup] --> H
+    end
+    
+    C -->|POST| M
+    I -->|Encrypted Payload| C
+    
+    style A fill:#2da44e
+    style B fill:#2da44e
+    style L fill:#0969da
+    style M fill:#cf222e
+```
+
+### Best Practices
+
+1. **Use Strong Passwords**: Minimum 12 characters with mixed case, numbers, and symbols
+2. **Share Passwords Securely**: Never send passwords through the same channel as chat links
+3. **Verify Participants**: Check the participant list before sharing sensitive information
+4. **Mind the Expiration**: Chats automatically delete after 24 hours
+5. **Destroy When Done**: Manually destroy chats containing sensitive information after use
+6. **Keep Browser Updated**: Ensure Web Crypto API support and security patches
+7. **Use HTTPS**: Always access the application over encrypted connections
+
+## Technical Specifications
+
+### Encryption Details
+
+- **Algorithm**: AES-256-GCM (Galois/Counter Mode)
+- **Key Derivation**: PBKDF2 with 100,000 iterations, SHA-256
+- **Initialization Vector**: 12 bytes of cryptographically secure random data per message
+- **Password Hashing**: Argon2id (server-side authentication only)
+
+### Database Schema
+
+**chats table**
+- `id`: TEXT PRIMARY KEY (random 32-character hex string)
+- `password_hash`: TEXT (Argon2id hash for authentication)
+- `created_at`: INTEGER (Unix timestamp)
+
+**messages table**
+- `id`: INTEGER PRIMARY KEY AUTOINCREMENT
+- `chat_id`: TEXT (foreign key to chats)
+- `user_id`: TEXT (client-generated UUID)
+- `encrypted_content`: TEXT (AES-256-GCM encrypted payload)
+- `timestamp`: INTEGER (Unix timestamp)
+- `edited`: INTEGER (boolean flag)
+- `deleted`: INTEGER (boolean flag)
+- `version`: INTEGER (optimistic locking counter)
+- `msg_type`: TEXT (message, join, leave, rename)
+
+**participants table**
+- `id`: INTEGER PRIMARY KEY AUTOINCREMENT
+- `chat_id`: TEXT (foreign key to chats)
+- `user_id`: TEXT (client-generated UUID)
+- `encrypted_name`: TEXT (encrypted username)
+- `last_seen`: INTEGER (Unix timestamp for heartbeat)
+
+### Browser Compatibility
+
+- Chrome/Edge 37+
+- Firefox 34+
+- Safari 11+
+- Opera 24+
+- Modern mobile browsers with Web Crypto API support
+
+## Troubleshooting
+
+### Common Issues
+
+**"Chat not found" error**
+- Verify the chat ID in the URL is correct
+- Check if the chat has expired (24-hour lifetime)
+- Ensure the server database is accessible
+
+**"Invalid password" error**
+- Confirm you're using the exact password (case-sensitive)
+- Check for extra spaces or characters
+- Request a new link from the chat creator
+
+**"Room is full" error**
+- Only 2 participants can join simultaneously
+- Wait for someone to leave or create a new chat
+
+**Messages not appearing**
+- Check your internet connection
+- Verify JavaScript is enabled
+- Clear browser cache and reload
+
+**Decryption failures**
+- Ensure you're using the correct password
+- Check if the encryption key matches (try re-entering password)
+- Verify browser Web Crypto API support
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit issues, fork the repository, and create pull requests for bug fixes or feature enhancements.
+
+### Development Setup
+
+1. Fork the repository
+2. Clone your fork locally
+3. Set up a local PHP development environment
+4. Make your changes
+5. Test thoroughly (encryption, message sync, edge cases)
+6. Submit a pull request with detailed description
+
+### Code Style
+
+- Follow PSR-12 coding standards for PHP
+- Use consistent JavaScript formatting (2-space indentation)
+- Comment complex cryptographic operations
+- Maintain the single-file architecture
+
+## License
 
 This project is licensed under the GNU General Public License v3.0.
 
----
+## Acknowledgments
 
-## 🤝 Contributing
-
-Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/xsukax/xsukax-E2E-Encrypted-PHP-Chat/issues).
-
-## ⚠️ Disclaimer
-
-This software is provided "as is" without warranty of any kind. While implementing strong cryptographic practices, no system is 100% secure. Users should conduct their own security assessment before using this application for sensitive communications. The authors are not responsible for any data loss or security breaches.
-
-## 📞 Support
-
-For questions or support, please open an issue on GitHub.
+Built with security and privacy as the foremost priorities, leveraging modern web standards and cryptographic best practices to provide a trustworthy communication platform.
 
 ---
 
-**Built with 🔒 for privacy-conscious users**
+**Security Notice**: While this application implements strong encryption, no system is perfectly secure. Always assess your threat model and use appropriate security measures for your specific use case. For highly sensitive communications, consider additional operational security practices.
