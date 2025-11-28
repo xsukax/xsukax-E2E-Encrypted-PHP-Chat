@@ -5,7 +5,7 @@ session_start();
 
 define('DB_FILE', 'chats.db');
 define('CHAT_LIFETIME', 24 * 60 * 60);
-define('HEARTBEAT_TIMEOUT', 30);
+define('HEARTBEAT_TIMEOUT', 120); // 2 minutes - more forgiving
 define('MAX_PARTICIPANTS', 2);
 
 function initDB() {
@@ -336,6 +336,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $chatId = $_POST['chat_id'] ?? '';
             $lastId = intval($_POST['last_id'] ?? 0);
             $knownVersions = json_decode($_POST['known_versions'] ?? '{}', true) ?: [];
+            $userId = $_POST['user_id'] ?? '';
+            
+            // Update last_seen on every message fetch (keeps presence alive)
+            if ($userId) {
+                $stmt = $db->prepare('UPDATE participants SET last_seen = :time WHERE chat_id = :chat_id AND user_id = :user_id');
+                $stmt->bindValue(':time', time(), SQLITE3_INTEGER);
+                $stmt->bindValue(':chat_id', $chatId, SQLITE3_TEXT);
+                $stmt->bindValue(':user_id', $userId, SQLITE3_TEXT);
+                $stmt->execute();
+            }
+            
+            // Get all participants for username lookup
+            $stmt = $db->prepare('SELECT user_id, encrypted_name FROM participants WHERE chat_id = :chat_id');
+            $stmt->bindValue(':chat_id', $chatId, SQLITE3_TEXT);
+            $result = $stmt->execute();
+            $participantNames = [];
+            while ($p = $result->fetchArray(SQLITE3_ASSOC)) {
+                $participantNames[$p['user_id']] = $p['encrypted_name'];
+            }
             
             $stmt = $db->prepare('SELECT id, user_id, encrypted_content, timestamp, edited, deleted, version, msg_type FROM messages WHERE chat_id = :chat_id AND id > :last_id ORDER BY id ASC LIMIT 100');
             $stmt->bindValue(':chat_id', $chatId, SQLITE3_TEXT);
@@ -352,7 +371,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'edited' => (int)$row['edited'],
                     'deleted' => (int)$row['deleted'],
                     'version' => (int)$row['version'],
-                    'msg_type' => $row['msg_type']
+                    'msg_type' => $row['msg_type'],
+                    'encrypted_current_name' => $participantNames[$row['user_id']] ?? null
                 ];
             }
             
@@ -378,13 +398,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             'edited' => (int)$row['edited'],
                             'deleted' => (int)$row['deleted'],
                             'version' => (int)$row['version'],
-                            'msg_type' => $row['msg_type']
+                            'msg_type' => $row['msg_type'],
+                            'encrypted_current_name' => $participantNames[$row['user_id']] ?? null
                         ];
                     }
                 }
             }
             
-            echo json_encode(['success' => true, 'messages' => $messages, 'updates' => $updates]);
+            echo json_encode([
+                'success' => true, 
+                'messages' => $messages, 
+                'updates' => $updates,
+                'participant_names' => $participantNames
+            ]);
             
         } elseif ($action === 'destroy_chat') {
             $chatId = $_POST['chat_id'] ?? '';
@@ -658,6 +684,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         let editingMessageId, confirmCallback = null, participants = [];
         let messageVersions = {};
         let hasJoinedRoom = false;
+        let participantNamesCache = {}; // Cache of user_id -> decrypted name
+        let participantEncryptedNames = {}; // Cache of user_id -> encrypted name (to detect changes)
 
         const adjectives = ['Swift', 'Bright', 'Clever', 'Gentle', 'Bold', 'Calm', 'Noble', 'Keen', 'Wise', 'Brave'];
         const nouns = ['Phoenix', 'Dragon', 'Eagle', 'Wolf', 'Tiger', 'Falcon', 'Bear', 'Fox', 'Hawk', 'Lion'];
@@ -806,13 +834,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             const list = document.getElementById('participantsList');
             let html = '';
             for (const p of participants) {
-                let name = 'Unknown';
-                if (p.encrypted_name) {
+                // Use cached name or decrypt
+                let name = participantNamesCache[p.user_id];
+                if (!name && p.encrypted_name) {
                     try {
-                        const dec = await decrypt(p.encrypted_name, encryptionKey);
-                        if (dec) name = dec;
+                        name = await decrypt(p.encrypted_name, encryptionKey);
+                        if (name) {
+                            participantNamesCache[p.user_id] = name;
+                            participantEncryptedNames[p.user_id] = p.encrypted_name;
+                        }
                     } catch {}
                 }
+                name = name || 'Unknown';
                 const isYou = p.user_id === currentUserId;
                 html += `<div class="participant-item"><span class="participant-dot"></span><span>${escapeHtml(name)}${isYou ? ' (you)' : ''}</span></div>`;
             }
@@ -848,6 +881,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 
                 if (data.success) {
                     setUserName(currentChatId, newName);
+                    
+                    // Update local cache so all messages update immediately
+                    participantNamesCache[currentUserId] = newName;
+                    participantEncryptedNames[currentUserId] = encName;
+                    updateAllDisplayedNames();
+                    
                     closeNicknameModal();
                     notify('Nickname changed to ' + newName, 'success');
                 } else {
@@ -1043,6 +1082,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     hasJoinedRoom = true;
                     participants = data.participants || [];
                     updateParticipantsBadge();
+                    
+                    // Initialize participant names cache
+                    participantNamesCache[currentUserId] = currentUserName;
+                    participantEncryptedNames[currentUserId] = encName;
+                    
+                    for (const p of participants) {
+                        if (p.encrypted_name && p.user_id !== currentUserId) {
+                            try {
+                                const decName = await decrypt(p.encrypted_name, encryptionKey);
+                                if (decName) {
+                                    participantNamesCache[p.user_id] = decName;
+                                    participantEncryptedNames[p.user_id] = p.encrypted_name;
+                                }
+                            } catch {}
+                        }
+                    }
                 } else if (data.error === 'Room is full') {
                     document.getElementById('joinScreen').style.display = 'none';
                     document.getElementById('roomFullScreen').style.display = 'block';
@@ -1082,6 +1137,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (data.success) {
                     participants = data.participants || [];
                     updateParticipantsBadge();
+                    
+                    // Update participant names from heartbeat response
+                    for (const p of participants) {
+                        if (p.encrypted_name && participantEncryptedNames[p.user_id] !== p.encrypted_name) {
+                            try {
+                                const decName = await decrypt(p.encrypted_name, encryptionKey);
+                                if (decName) {
+                                    participantNamesCache[p.user_id] = decName;
+                                    participantEncryptedNames[p.user_id] = p.encrypted_name;
+                                }
+                            } catch {}
+                        }
+                    }
                 }
             } catch {}
         }
@@ -1094,7 +1162,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             document.getElementById('currentUserName').textContent = currentUserName;
             loadMessages();
             pollInterval = setInterval(loadMessages, 2000);
-            heartbeatInterval = setInterval(sendHeartbeat, 10000);
+            heartbeatInterval = setInterval(sendHeartbeat, 5000); // More frequent heartbeat
         }
 
         function copyShareLink() {
@@ -1157,6 +1225,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 const fd = new FormData();
                 fd.append('action', 'get_messages');
                 fd.append('chat_id', currentChatId);
+                fd.append('user_id', currentUserId);
                 fd.append('last_id', lastMessageId);
                 fd.append('known_versions', JSON.stringify(messageVersions));
                 
@@ -1167,6 +1236,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 
                 const container = document.getElementById('messagesContainer');
                 const shouldScroll = container.scrollHeight - container.scrollTop <= container.clientHeight + 100;
+                
+                // Update participant names cache and check for changes
+                if (data.participant_names) {
+                    let namesChanged = false;
+                    for (const [uId, encName] of Object.entries(data.participant_names)) {
+                        if (participantEncryptedNames[uId] !== encName) {
+                            participantEncryptedNames[uId] = encName;
+                            // Decrypt and cache the name
+                            try {
+                                const decName = await decrypt(encName, encryptionKey);
+                                if (decName && participantNamesCache[uId] !== decName) {
+                                    participantNamesCache[uId] = decName;
+                                    namesChanged = true;
+                                }
+                            } catch {}
+                        }
+                    }
+                    
+                    // If names changed, update all displayed messages from those users
+                    if (namesChanged) {
+                        updateAllDisplayedNames();
+                    }
+                }
                 
                 // Handle updates to existing messages
                 if (data.updates && data.updates.length > 0) {
@@ -1222,6 +1314,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 console.error('Load messages error:', e);
             }
         }
+        
+        function updateAllDisplayedNames() {
+            // Update all message usernames with current names from cache
+            document.querySelectorAll('.message-wrapper[data-user-id]').forEach(wrapper => {
+                const userId = wrapper.dataset.userId;
+                const currentName = participantNamesCache[userId];
+                if (currentName) {
+                    const usernameEl = wrapper.querySelector('.message-username');
+                    if (usernameEl) {
+                        usernameEl.textContent = currentName;
+                    }
+                }
+            });
+        }
 
         async function renderSystemMessage(msg, container) {
             const dec = await decrypt(msg.encrypted_content, encryptionKey);
@@ -1265,17 +1371,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             let msgData;
             try { msgData = JSON.parse(dec); } catch { msgData = { text: dec, userName: 'User' }; }
             
+            // Use current name from cache, or decrypt from message's encrypted_current_name, or fallback to stored name
+            let displayName = participantNamesCache[msg.user_id];
+            if (!displayName && msg.encrypted_current_name) {
+                try {
+                    displayName = await decrypt(msg.encrypted_current_name, encryptionKey);
+                    if (displayName) {
+                        participantNamesCache[msg.user_id] = displayName;
+                        participantEncryptedNames[msg.user_id] = msg.encrypted_current_name;
+                    }
+                } catch {}
+            }
+            if (!displayName) {
+                displayName = msgData.userName || 'Anonymous';
+            }
+            
             const isMine = msg.user_id === currentUserId;
             const wrapper = document.createElement('div');
             wrapper.className = `message-wrapper ${isMine ? 'sent' : 'received'}`;
             wrapper.id = `msg-${msg.id}`;
+            wrapper.dataset.userId = msg.user_id; // For name updates
             
             const bubble = document.createElement('div');
             bubble.className = `message ${isMine ? 'sent' : 'received'}`;
             
             bubble.innerHTML = `
                 <div class="message-header">
-                    <span class="message-username">${escapeHtml(msgData.userName || 'Anonymous')}</span>
+                    <span class="message-username">${escapeHtml(displayName)}</span>
                     <span class="message-time">${new Date(msg.timestamp * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
                 </div>
                 <div class="message-text">${escapeHtml(msgData.text)}</div>
