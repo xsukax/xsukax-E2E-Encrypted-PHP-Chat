@@ -5,7 +5,7 @@ session_start();
 
 define('DB_FILE', 'chats.db');
 define('CHAT_LIFETIME', 24 * 60 * 60);
-define('HEARTBEAT_TIMEOUT', 120); // 2 minutes - more forgiving
+define('HEARTBEAT_TIMEOUT', 120);
 define('MAX_PARTICIPANTS', 2);
 
 function initDB() {
@@ -338,7 +338,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $knownVersions = json_decode($_POST['known_versions'] ?? '{}', true) ?: [];
             $userId = $_POST['user_id'] ?? '';
             
-            // Update last_seen on every message fetch (keeps presence alive)
             if ($userId) {
                 $stmt = $db->prepare('UPDATE participants SET last_seen = :time WHERE chat_id = :chat_id AND user_id = :user_id');
                 $stmt->bindValue(':time', time(), SQLITE3_INTEGER);
@@ -347,7 +346,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $stmt->execute();
             }
             
-            // Get all participants for username lookup
             $stmt = $db->prepare('SELECT user_id, encrypted_name FROM participants WHERE chat_id = :chat_id');
             $stmt->bindValue(':chat_id', $chatId, SQLITE3_TEXT);
             $result = $stmt->execute();
@@ -500,6 +498,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         .message.received .message-username { color: #24292f; }
         .message-time { font-size: 0.65rem; opacity: 0.65; white-space: nowrap; }
         .message-text { line-height: 1.4; word-break: break-word; }
+        .message-text a { color: inherit; text-decoration: underline; font-weight: 500; word-break: break-all; }
+        .message.sent .message-text a { color: #0550ae; }
+        .message.received .message-text a { color: #0969da; }
+        .message-text a:hover { text-decoration-style: solid; opacity: 0.8; }
         .message-edited { font-size: 0.65rem; font-style: italic; opacity: 0.65; margin-top: 0.125rem; }
         .message-actions { display: flex; gap: 0.25rem; margin-top: 0.375rem; flex-wrap: wrap; }
         .input-area { background: #ffffff; border-top: 1px solid #e1e4e8; padding: 0.75rem 1rem; padding-bottom: calc(0.75rem + var(--safe-bottom)); display: flex; gap: 0.5rem; align-items: center; box-shadow: 0 -1px 0 rgba(27,31,35,0.04); }
@@ -684,8 +686,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         let editingMessageId, confirmCallback = null, participants = [];
         let messageVersions = {};
         let hasJoinedRoom = false;
-        let participantNamesCache = {}; // Cache of user_id -> decrypted name
-        let participantEncryptedNames = {}; // Cache of user_id -> encrypted name (to detect changes)
+        let participantNamesCache = {};
+        let participantEncryptedNames = {};
 
         const adjectives = ['Swift', 'Bright', 'Clever', 'Gentle', 'Bold', 'Calm', 'Noble', 'Keen', 'Wise', 'Brave'];
         const nouns = ['Phoenix', 'Dragon', 'Eagle', 'Wolf', 'Tiger', 'Falcon', 'Bear', 'Fox', 'Hawk', 'Lion'];
@@ -764,7 +766,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         function notify(msg, type = 'info') {
             const n = document.createElement('div');
             n.className = `notification ${type}`;
-            const icons = { success: '✔', error: '✗', warning: '⚠', info: 'ℹ' };
+            const icons = { success: '✓', error: '✗', warning: '⚠', info: 'ℹ' };
             n.innerHTML = `<div style="font-weight: 600; margin-bottom: 0.25rem; font-size: 0.8125rem;">${icons[type] || 'ℹ'} ${type.toUpperCase()}</div><div style="font-size: 0.8125rem;">${escapeHtml(msg)}</div>`;
             document.body.appendChild(n);
             setTimeout(() => n.remove(), 3500);
@@ -834,7 +836,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             const list = document.getElementById('participantsList');
             let html = '';
             for (const p of participants) {
-                // Use cached name or decrypt
                 let name = participantNamesCache[p.user_id];
                 if (!name && p.encrypted_name) {
                     try {
@@ -881,12 +882,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 
                 if (data.success) {
                     setUserName(currentChatId, newName);
-                    
-                    // Update local cache so all messages update immediately
                     participantNamesCache[currentUserId] = newName;
                     participantEncryptedNames[currentUserId] = encName;
                     updateAllDisplayedNames();
-                    
                     closeNicknameModal();
                     notify('Nickname changed to ' + newName, 'success');
                 } else {
@@ -914,19 +912,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 
                 if (data.success) {
                     messageVersions[editingMessageId] = data.version;
-                    
-                    // Update DOM immediately for the editing user
                     const msgEl = document.getElementById(`msg-${editingMessageId}`);
                     if (msgEl) {
-                        msgEl.querySelector('.message-text').textContent = text;
-                        
-                        // Update the Edit button's onclick with new text
+                        msgEl.querySelector('.message-text').innerHTML = linkifyText(text);
                         const editBtn = msgEl.querySelector('.message-actions button:first-child');
                         if (editBtn) {
                             editBtn.onclick = () => showEditModal(editingMessageId, text);
                         }
-                        
-                        // Add (edited) label if not already present
                         if (!msgEl.querySelector('.message-edited')) {
                             const editedDiv = document.createElement('div');
                             editedDiv.className = 'message-edited';
@@ -939,7 +931,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             }
                         }
                     }
-                    
                     notify('Message updated', 'success');
                     closeEditModal();
                 } else {
@@ -962,8 +953,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 
                 if (data.success) {
                     messageVersions[id] = data.version;
-                    
-                    // Update DOM immediately for the deleting user
                     const msgEl = document.getElementById(`msg-${id}`);
                     if (msgEl) {
                         const bubble = msgEl.querySelector('.message');
@@ -974,7 +963,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         const edited = msgEl.querySelector('.message-edited');
                         if (edited) edited.remove();
                     }
-                    
                     notify('Message deleted', 'success');
                 } else {
                     notify('Failed to delete message', 'error');
@@ -1069,7 +1057,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 fd.append('user_id', currentUserId);
                 fd.append('encrypted_name', encName);
                 
-                // Only send join notification on first join
                 if (sendNotification && !hasJoinedRoom) {
                     const joinMsg = await encrypt(JSON.stringify({ type: 'join', userName: currentUserName }), encryptionKey);
                     fd.append('encrypted_join_msg', joinMsg);
@@ -1082,8 +1069,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     hasJoinedRoom = true;
                     participants = data.participants || [];
                     updateParticipantsBadge();
-                    
-                    // Initialize participant names cache
                     participantNamesCache[currentUserId] = currentUserName;
                     participantEncryptedNames[currentUserId] = encName;
                     
@@ -1138,7 +1123,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     participants = data.participants || [];
                     updateParticipantsBadge();
                     
-                    // Update participant names from heartbeat response
                     for (const p of participants) {
                         if (p.encrypted_name && participantEncryptedNames[p.user_id] !== p.encrypted_name) {
                             try {
@@ -1162,7 +1146,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             document.getElementById('currentUserName').textContent = currentUserName;
             loadMessages();
             pollInterval = setInterval(loadMessages, 2000);
-            heartbeatInterval = setInterval(sendHeartbeat, 5000); // More frequent heartbeat
+            heartbeatInterval = setInterval(sendHeartbeat, 5000);
         }
 
         function copyShareLink() {
@@ -1220,6 +1204,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
 
+        function linkifyText(text) {
+            const urlRegex = /(?:(?:https?|ftp):\/\/|www\.)[^\s/$.?#].[^\s]*/gi;
+            const escapedText = escapeHtml(text);
+            
+            return escapedText.replace(urlRegex, (url) => {
+                let href = url;
+                if (!url.match(/^https?:\/\//i)) {
+                    href = 'http://' + url;
+                }
+                
+                try {
+                    new URL(href);
+                    return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(url)}</a>`;
+                } catch {
+                    return escapeHtml(url);
+                }
+            });
+        }
+
         async function loadMessages() {
             try {
                 const fd = new FormData();
@@ -1237,13 +1240,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 const container = document.getElementById('messagesContainer');
                 const shouldScroll = container.scrollHeight - container.scrollTop <= container.clientHeight + 100;
                 
-                // Update participant names cache and check for changes
                 if (data.participant_names) {
                     let namesChanged = false;
                     for (const [uId, encName] of Object.entries(data.participant_names)) {
                         if (participantEncryptedNames[uId] !== encName) {
                             participantEncryptedNames[uId] = encName;
-                            // Decrypt and cache the name
                             try {
                                 const decName = await decrypt(encName, encryptionKey);
                                 if (decName && participantNamesCache[uId] !== decName) {
@@ -1254,13 +1255,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         }
                     }
                     
-                    // If names changed, update all displayed messages from those users
                     if (namesChanged) {
                         updateAllDisplayedNames();
                     }
                 }
                 
-                // Handle updates to existing messages
                 if (data.updates && data.updates.length > 0) {
                     for (const msg of data.updates) {
                         messageVersions[msg.id] = msg.version;
@@ -1278,7 +1277,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 if (dec) {
                                     let msgData;
                                     try { msgData = JSON.parse(dec); } catch { msgData = { text: dec }; }
-                                    existingEl.querySelector('.message-text').textContent = msgData.text;
+                                    existingEl.querySelector('.message-text').innerHTML = linkifyText(msgData.text);
                                     if (!existingEl.querySelector('.message-edited')) {
                                         const editedDiv = document.createElement('div');
                                         editedDiv.className = 'message-edited';
@@ -1291,7 +1290,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                 }
                 
-                // Handle new messages
                 if (data.messages && data.messages.length > 0) {
                     for (const msg of data.messages) {
                         if (displayedMessages.has(msg.id)) continue;
@@ -1316,7 +1314,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         
         function updateAllDisplayedNames() {
-            // Update all message usernames with current names from cache
             document.querySelectorAll('.message-wrapper[data-user-id]').forEach(wrapper => {
                 const userId = wrapper.dataset.userId;
                 const currentName = participantNamesCache[userId];
@@ -1371,7 +1368,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             let msgData;
             try { msgData = JSON.parse(dec); } catch { msgData = { text: dec, userName: 'User' }; }
             
-            // Use current name from cache, or decrypt from message's encrypted_current_name, or fallback to stored name
             let displayName = participantNamesCache[msg.user_id];
             if (!displayName && msg.encrypted_current_name) {
                 try {
@@ -1390,7 +1386,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             const wrapper = document.createElement('div');
             wrapper.className = `message-wrapper ${isMine ? 'sent' : 'received'}`;
             wrapper.id = `msg-${msg.id}`;
-            wrapper.dataset.userId = msg.user_id; // For name updates
+            wrapper.dataset.userId = msg.user_id;
             
             const bubble = document.createElement('div');
             bubble.className = `message ${isMine ? 'sent' : 'received'}`;
@@ -1400,7 +1396,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     <span class="message-username">${escapeHtml(displayName)}</span>
                     <span class="message-time">${new Date(msg.timestamp * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
                 </div>
-                <div class="message-text">${escapeHtml(msgData.text)}</div>
+                <div class="message-text">${linkifyText(msgData.text)}</div>
             `;
             
             if (msg.edited) {
@@ -1446,12 +1442,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (currentChatId && currentUserId) leaveRoom();
         });
 
-        // Only pause/resume heartbeat on visibility change, don't leave/rejoin
         window.addEventListener('visibilitychange', () => {
             if (!currentChatId || !encryptionKey) return;
             
             if (document.visibilityState === 'visible') {
-                // Resume polling and heartbeat when tab becomes visible
                 if (!pollInterval) {
                     loadMessages();
                     pollInterval = setInterval(loadMessages, 2000);
@@ -1460,9 +1454,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     sendHeartbeat();
                     heartbeatInterval = setInterval(sendHeartbeat, 10000);
                 }
-            } else {
-                // Optionally slow down polling when hidden (but don't leave)
-                // The heartbeat will keep presence alive
             }
         });
     </script>
