@@ -2,7 +2,7 @@
 
 A secure, self-hosted, end-to-end encrypted chat application built with PHP and vanilla JavaScript. This zero-knowledge chat system ensures that your conversations remain private, with messages encrypted client-side before transmission and automatic cleanup after 24 hours.
 
-**Demo:** [https://xsukax.net/chat](https://xsukax.net/chat)
+**Demo:** [https://xpchat.gt.tc](https://xpchat.gt.tc)
 
 ## Project Overview
 
